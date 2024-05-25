@@ -1,7 +1,6 @@
-use crate::fs::FS_BLK_SIZE;
+use crate::utils::FS_BLK_SIZE;
+use super::Ino;
 use serde::{Deserialize, Serialize};
-
-pub type Ino = u64;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Slice {
