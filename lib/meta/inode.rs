@@ -1,24 +1,10 @@
+use super::{Ino, MetaItem};
 use crate::utils::FS_BLK_SIZE;
-use super::Ino;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Slice {
-    pos: u32,    // offset from chunk start
-    length: u32, // continuous data length
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Chunk {
-    index: u32,         // which chunk in file
-    length: u32,        // total length of used bytes in chunk
-    slices: Vec<Slice>, // scatter-gather small un-sequence blocks data in chunk
-}
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
 pub enum Itype {
     File,
-    Link,
     Dir,
 }
 
@@ -35,7 +21,6 @@ pub struct Inode {
     pub ctime: u64,
     pub length: u64,
     pub links: u32,
-    pub chunks: Vec<Chunk>,
 }
 
 impl Inode {
@@ -43,7 +28,21 @@ impl Inode {
         self.length / FS_BLK_SIZE + (if self.length % FS_BLK_SIZE > 0 { 1 } else { 0 })
     }
 
-    pub fn se(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("can't serialize inode")
+    pub fn key(ino: Ino) -> String {
+        format!("i_{}", ino)
+    }
+
+    pub fn val(this: &Self) -> Vec<u8> {
+        bincode::serialize(this).expect("can't serialize inode")
+    }
+}
+
+impl MetaItem for Inode {
+    fn key(&self) -> String {
+        Self::key(self.id)
+    }
+
+    fn val(&self) -> Vec<u8> {
+        Self::val(self)
     }
 }

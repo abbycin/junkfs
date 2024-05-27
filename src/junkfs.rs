@@ -1,39 +1,52 @@
 use junkfs::fs::Fs;
+use junkfs::logger::Logger;
 use libc::{sighandler_t, SIGINT, SIGTERM};
-use std::thread::sleep;
-use std::time::Duration;
 
 fn main() {
+    let log_path = "/tmp/junkfs.log";
+    Logger::init().add_file(&log_path, true);
+    log::set_max_level(log::LevelFilter::Info);
     if std::env::args().len() != 3 {
         eprintln!("{} meta_path mount_point", std::env::args().nth(0).unwrap());
         std::process::exit(1);
     }
 
-    setup_signal_handler();
-
+    println!("log write to {}", log_path);
     let meta_path = std::env::args().nth(1).unwrap();
     let mount_point = std::env::args().nth(2).unwrap();
+
+    setup_signal_handler();
 
     let junkfs = Fs::new(meta_path);
     match junkfs {
         Err(e) => {
-            eprintln!("load filesystem fail, error {e}");
+            log::error!("load filesystem fail, error {e}");
             std::process::exit(1);
         }
         Ok(junkfs) => {
-            let options = [fuser::MountOption::FSName("chaosfs".to_string())];
-            let session = fuser::spawn_mount2(junkfs, &mount_point, &options).expect("can't mount");
-            wait_signal();
-            session.join();
+            let options = [
+                fuser::MountOption::FSName("jfs".to_string()),
+                fuser::MountOption::Subtype("jfs".to_string()),
+            ];
+            // let session = fuser::spawn_mount2(junkfs, &mount_point, &options).expect("can't mount");
+            // wait_signal();
+            // session.join();
+
+            let r = fuser::mount2(junkfs, &mount_point, &options);
+            match r {
+                Err(e) => {
+                    log::error!("mount fail, error {}", e.to_string());
+                    std::process::exit(1);
+                }
+                Ok(()) => {}
+            }
         }
     }
-
-    std::process::exit(0);
 }
 
 static mut IS_QUIT: bool = false;
 
-extern "C" fn handle_signal(sig: i32) {
+extern "C" fn handle_signal(_sig: i32) {
     unsafe {
         IS_QUIT = true;
     }
@@ -47,10 +60,9 @@ fn setup_signal_handler() {
     }
 }
 
+#[allow(dead_code)]
 fn wait_signal() {
     unsafe {
-        while !IS_QUIT {
-            sleep(Duration::from_secs(1));
-        }
+        libc::pause();
     }
 }

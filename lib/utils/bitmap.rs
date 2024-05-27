@@ -1,3 +1,4 @@
+use crate::utils::align_up;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -7,31 +8,25 @@ pub struct BitMap {
     count: u64,
 }
 
-const fn is_power_of2(size: u64) -> bool {
-    (size > 0) && (size & (size - 1)) == 0
-}
-
 const fn roundup_align8(size: u64) -> u64 {
-    (size + 7) & (!7)
+    align_up(size, 8) as u64
 }
 
 impl BitMap {
-    pub fn new(size: u64) -> Self {
-        let size = roundup_align8(size >> 3);
-        if !is_power_of2(size) {
-            panic!("invalid size for bitmap, expect power of 2");
-        }
-        let mut v = Vec::with_capacity(size as usize);
-        v.resize(size as usize, 0);
+    pub fn new(cnt: u64) -> Self {
+        let up = roundup_align8(cnt);
+        // the bytes << 3 may greater than cnt, say cnt is 9, bytes << 3 will be 16
+        let bytes = up >> 3;
+        assert!((bytes << 3) >= cnt);
         Self {
-            data: v,
-            size: size * 8,
+            data: vec![0u8; bytes as usize],
+            size: cnt,
             count: 0,
         }
     }
 
     pub fn add(&mut self, bit: u64) -> bool {
-        if self.test(bit) || self.count == self.size {
+        if self.test(bit) || self.full() {
             return false;
         }
 
@@ -40,7 +35,7 @@ impl BitMap {
         return true;
     }
 
-    pub fn test(&self, mut bit: u64) -> bool {
+    pub fn test(&self, bit: u64) -> bool {
         if (self.data[(bit >> 3) as usize] & (1 << (bit & 7))) != 0 {
             true
         } else {
@@ -62,7 +57,7 @@ impl BitMap {
     }
 
     pub fn full(&self) -> bool {
-        self.len() == self.cap()
+        self.count == self.size
     }
 
     pub fn alloc(&mut self) -> Option<u64> {
@@ -77,6 +72,14 @@ impl BitMap {
             }
             None
         }
+    }
+
+    pub fn free(&mut self, bit: u64) -> bool {
+        if !self.test(bit) {
+            return false;
+        }
+        self.del(bit);
+        return true;
     }
 }
 

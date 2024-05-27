@@ -1,146 +1,147 @@
-use crate::meta::Ino;
-use crate::utils::{get_data_path, FS_BLK_SIZE};
+use crate::meta::{Ino, Meta};
+use crate::store::{Entry, Store};
+use crate::utils::{get_data_path, FS_BLK_SIZE, FS_FUSE_MAX_IO_SIZE};
+use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::os::unix::prelude::FileExt;
 
-/// `FileStore` provide interface to access fixed size block on disk, it will create block when necessary
-/// and the block is always locate in the form `location/ino/block_idx_off_size` where `block_idx`
-/// is `pos / FS_BLK_SIZE` and `off` is `pos % FS_BLK_SIZE` which is in block offset, and the `size`
-/// is one `write_at` size
-/// **NOTE: no cache support at present!!**
 pub struct FileStore {
-    pub fh: u64,
-    ofs: HashMap<String, std::fs::File>, // key => `ino-blk-off-size`
+    w_ofs: HashMap<u64, std::fs::File>, // key is blk_id
+    r_ofs: HashMap<u64, std::fs::File>,
+}
+
+fn build_path(ino: Ino, blk: u64) -> String {
+    format!("{}/{}/{}", get_data_path(), ino, blk)
+}
+
+fn build_dir(ino: Ino) -> String {
+    format!("{}/{}", get_data_path(), ino)
 }
 
 impl FileStore {
-    fn build_dir(&self, ino: Ino) -> String {
-        format!("{}/{ino}", get_data_path())
+    pub fn new() -> Self {
+        Self {
+            w_ofs: HashMap::new(),
+            r_ofs: HashMap::new(),
+        }
     }
 
-    fn build_path(&self, ino: Ino, index: u64, off: u64, size: usize) -> String {
-        format!("{}/{}/{}_{}_{}", get_data_path(), ino, index, off, size)
+    pub fn unlink(ino: Ino, blk_id: u64) {
+        let p = build_path(ino, blk_id);
+        // it's not necessary to remove key from ofs, since the whole FileStore
+        // will be dropped after `unlink``
+        match std::fs::remove_file(&p) {
+            Err(e) => {
+                log::error!("can't remove {} error {}", p, e);
+            }
+            Ok(_) => {
+                log::info!("remove file {}", p);
+            }
+        }
     }
 
-    fn build_key(&self, ino: Ino, blk: u64, off: u64, size: usize) -> String {
-        format!("{ino}-{blk}-{off}-{size}")
+    fn get_fp<'a, 'b>(m: &'a mut HashMap<u64, std::fs::File>, ino: Ino, key: u64) -> Option<&'b mut std::fs::File>
+    where
+        'a: 'b,
+    {
+        let tmp = m.contains_key(&key);
+        if !tmp {
+            let _ = std::fs::create_dir_all(&build_dir(ino));
+            let fpath = build_path(ino, key);
+            // NOTE: do NOT use append, see `File::write_at` doc `pwrite64` bug
+            let f = std::fs::File::options()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&fpath);
+            if f.is_err() {
+                log::error!("can't create {}", fpath);
+                return None;
+            }
+            m.insert(key, f.unwrap());
+            return m.get_mut(&key);
+        } else {
+            m.get_mut(&key)
+        }
     }
+    fn write_impl(&mut self, ino: Ino, e: &Entry) -> bool {
+        let fp = Self::get_fp(&mut self.w_ofs, ino, e.blk_id);
 
-    fn extract_pos(&self, pos: u64, size: usize) -> (u64, u64, usize) {
-        let blk_idx = pos / FS_BLK_SIZE;
-        let in_blk_off = pos % FS_BLK_SIZE;
-        let mut len = (FS_BLK_SIZE - pos) as usize;
-
-        if len > size {
-            len = size;
+        if fp.is_none() {
+            return false;
         }
 
-        (blk_idx, in_blk_off, len)
+        let fp = fp.unwrap();
+        unsafe {
+            let s = std::slice::from_raw_parts(e.data, e.size as usize);
+            let r = fp.write_at(s, e.blk_off);
+            if r.is_err() {
+                log::error!("can't write entry {:?}", e);
+                return false;
+            }
+        }
+        return true;
     }
 
-    fn open_file(&mut self, ino: Ino, index: u64, off: u64, size: usize) -> Option<&mut std::fs::File> {
-        let key = self.build_key(ino, index, off, size);
-        if self.ofs.contains_key(&key) {
-            return self.ofs.get_mut(&key);
-        }
-        let r = std::fs::create_dir_all(&self.build_dir(ino)); // ignore result
-        if r.is_err() {
-            eprint!("can't create dir {} errno {}", self.build_dir(ino), r.err().unwrap());
+    fn read_impl(&mut self, ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {
+        let blk_id = off / FS_BLK_SIZE;
+        let fp = Self::get_fp(&mut self.r_ofs, ino, blk_id);
+        if fp.is_none() {
             return None;
         }
-        let fpath = self.build_path(ino, index, off, size);
-
-        // TODO: we need to check last current `p` has same prefix to `fpath` namely, same bock, maybe
-        // same pos, but differnect size, or different pos and different size
-        // for first case, we can return rest space to FS_BLK_SIZE to write, and split a write into
-        // two write, first write fill rest space of a old block, second write create new block
-        // for second case, if new pos small than or equal to old pos, then do as first case, or else check new
-        // size and old size, if old_pos + old_size < new_pos, fill zero to range [old_pos + old_size, new_pos - old_size]
-        // or else do as first case, overwrite old data
-        // NOTE: we need rename the old block to new size (total size including zeroes range)
-        match std::fs::File::create(&fpath) {
-            Err(e) => {
-                eprintln!("can't crate file {}", fpath);
-                None
-            }
-            Ok(file) => {
-                self.ofs.insert(key.clone(), file);
-                self.ofs.get_mut(&key)
-            }
+        let fp = fp.unwrap();
+        let mut sz = min(FS_FUSE_MAX_IO_SIZE, size as u64);
+        // check off + sz is cross chunk, if so, read at most rest bytes in current block
+        if (off + sz) / FS_BLK_SIZE == (blk_id + 1) {
+            sz = (blk_id + 1) * FS_BLK_SIZE - off;
         }
+        let mut v = vec![0u8; sz as usize];
+        let buf = v.as_mut_slice();
+        let r = fp.read_at(buf, off % FS_BLK_SIZE);
+        if r.is_err() {
+            log::error!(
+                "can't read data blk_id {} off {} size {}",
+                blk_id,
+                off % FS_BLK_SIZE,
+                sz
+            );
+            return None;
+        }
+        Some(v)
     }
+}
 
-    pub fn new(fh: u64) -> Self {
-        Self {
-            fh,
-            ofs: HashMap::new(),
+impl Store for FileStore {
+    fn write(&mut self, meta: &mut Meta, ino: Ino, buf: &Vec<Entry>) {
+        if buf.is_empty() {
+            return;
         }
-    }
+        let mut sz = 0;
+        let mut inode = meta.load_inode(ino).unwrap();
 
-    // write at most one block a time
-    fn write_block(&mut self, ino: Ino, pos: u64, data: &[u8], size: usize) -> std::io::Result<usize> {
-        let (index, off, len) = self.extract_pos(pos, size);
-        let f = self.open_file(ino, index, off, len);
-        if f.is_none() {
-            let e = std::io::Error::from(std::io::ErrorKind::NotFound);
-            return Err(e);
-        }
-        let f = f.unwrap();
-        let len = len as usize;
-        let off = off as usize;
-
-        let buf = &data[off..len];
-        let r = f.write_at(buf, off as u64)?;
-        assert_eq!(r, len);
-        // the len is either FS_BLOCK_SIZE - off or data.len()
-        Ok(len)
-    }
-
-    /// - `pos` is global offset in file
-    /// - `data` is current buffer to write
-    pub fn write_at(&mut self, ino: Ino, pos: u64, data: &[u8]) -> std::io::Result<usize> {
-        let size = data.len();
-        let mut pos = pos;
-        let mut data = data;
-        let mut cnt = 0;
-
-        while cnt < size {
-            let r = self.write_block(ino, pos, data, size - cnt)?;
-            pos += r as u64;
-            data = &data[r..];
-            cnt += r;
-        }
-        assert_eq!(cnt, size);
-        Ok(cnt)
-    }
-
-    /// - `pos` is global offset in file
-    /// - `size` read at most one block
-    pub fn read_at(&mut self, ino: Ino, pos: u64, size: u64) -> std::io::Result<Vec<u8>> {
-        let (index, off, size) = self.extract_pos(pos, size as usize);
-        let p = self.build_path(ino, index, off, size);
-        let fpath = std::path::Path::new(&p);
-
-        // check file exist, if not return error
-        if !fpath.exists() {
-            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
-        }
-
-        let file = self.open_file(ino, index, off, size);
-        if file.is_none() {
-            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
-        }
-
-        let file = file.unwrap();
-        let mut v = vec![0u8; size];
-        let mut buf = v.as_mut_slice();
-
-        match file.read_at(&mut buf, off) {
-            Err(e) => Err(e),
-            Ok(n) => {
-                assert_eq!(n, size);
-                Ok(v)
+        for e in buf {
+            sz = max(sz, e.off + e.size);
+            log::info!(
+                "write off {} size {} inode.length {} size {}",
+                e.off,
+                e.size,
+                inode.length,
+                sz
+            );
+            if !self.write_impl(ino, e) {
+                return;
             }
         }
+
+        // try update inode.length
+        if inode.length < sz {
+            log::info!("trying to update inode.length {} to {}", inode.length, sz);
+            inode.length = sz;
+            meta.store_inode(&inode).unwrap()
+        }
+    }
+
+    fn read(&mut self, ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {
+        self.read_impl(ino, off, size)
     }
 }
