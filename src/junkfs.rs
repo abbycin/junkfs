@@ -5,7 +5,7 @@ use libc::{sighandler_t, SIGINT, SIGTERM};
 fn main() {
     let log_path = "/tmp/junkfs.log";
     Logger::init().add_file(&log_path, true);
-    log::set_max_level(log::LevelFilter::Info);
+    log::set_max_level(log::LevelFilter::Warn);
     if std::env::args().len() != 3 {
         eprintln!("{} meta_path mount_point", std::env::args().nth(0).unwrap());
         std::process::exit(1);

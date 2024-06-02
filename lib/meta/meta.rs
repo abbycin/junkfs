@@ -103,7 +103,7 @@ impl Meta {
             }
             Ok(dentry) => {
                 if dentry.is_none() {
-                    log::error!("can't find dentry {}", parent);
+                    log::warn!("can't find dentry {}", parent);
                     return None;
                 }
                 let dentry = dentry.unwrap();

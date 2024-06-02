@@ -152,7 +152,7 @@ impl Filesystem for Fs {
             let attr = to_attr(&inode);
             reply.entry(&ttl, &attr, 0);
         } else {
-            log::error!("lookup fail parent {} name {}", parent, name);
+            log::warn!("lookup fail parent {} name {}", parent, name);
             reply.error(ENOENT);
         }
     }
