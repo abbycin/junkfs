@@ -1,6 +1,6 @@
 mod bitmap;
 
-use crate::meta::{Ino, Inode, Itype};
+use crate::meta::{Inode, Itype};
 pub use bitmap::BitMap;
 use fuser::{FileAttr, FileType};
 use once_cell::sync::Lazy;
@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CHUNK_SIZE: u64 = 1 << 26;
 pub const BLOCK_SIZE: u64 = 1 << 22;
-pub const FS_BLK_SIZE: u64 = 4 << 20;
+pub const FS_BLK_SIZE: u64 = 128 << 20;
 pub const FS_FUSE_MAX_IO_SIZE: u64 = 128u64 << 10;
 pub const FS_TOTAL_INODES: u32 = 1 << 20;
 pub const FS_META_CACHE_SIZE: usize = 16384;

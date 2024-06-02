@@ -7,13 +7,11 @@ mod super_block;
 
 use crate::meta::meta::NameT;
 use crate::store::CacheStore;
-use bytes::Bytes;
 pub use inode::{Inode, Itype};
 pub use meta::{Ino, Meta};
 use meta_store::MetaStore;
-use sled::SledStore;
 
-pub trait MetaItem {
+pub trait MetaKV {
     fn key(&self) -> String;
 
     fn val(&self) -> Vec<u8>;

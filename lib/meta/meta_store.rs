@@ -1,5 +1,3 @@
-use sled::IVec;
-
 pub struct MetaIter {
     pub iter: Box<dyn Iterator<Item = Option<Vec<u8>>>>,
 }
@@ -15,7 +13,7 @@ pub trait MetaStore {
 
     fn contains_key(&self, key: &str) -> Result<bool, String>;
 
-    fn flush(&mut self);
+    fn flush(&self);
 }
 
 impl MetaIter {

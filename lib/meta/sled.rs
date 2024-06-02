@@ -1,10 +1,11 @@
 use crate::cache::{LRUCache, Store};
 use crate::meta::meta_store::{MetaIter, MetaStore};
-use crate::meta::{Ino, MetaItem};
 use sled::IVec;
+use std::cell::RefCell;
 
 pub struct SledStore {
-    cache: LRUCache<Ino, Box<dyn MetaItem>>,
+    /// read cache
+    cache: RefCell<LRUCache<String, Vec<u8>>>,
     db: sled::Db,
 }
 
@@ -20,25 +21,27 @@ fn tranform_iter<T: Iterator<Item = Result<(IVec, IVec), sled::Error>>>(
     })
 }
 
-impl SledStore {
-    pub fn new(meta_path: &str, cache_cap: usize) -> Self {
-        let mut s = Self {
-            cache: LRUCache::new(cache_cap),
-            db: sled::open(meta_path).unwrap(),
-        };
-        let p = std::ptr::addr_of_mut!(s);
-        s.cache.set_backend(p);
-        s
+impl Store<String, Vec<u8>> for SledStore {
+    fn store(&mut self, key: String, data: Vec<u8>) {
+        match self.db.insert(&key, data.as_slice()) {
+            Err(e) => {
+                log::error!("can't store key {} error {}", key, e.to_string());
+            }
+            Ok(_) => {}
+        }
     }
 }
 
-impl Store<Box<dyn MetaItem>> for SledStore {
-    fn store(&mut self, data: &Box<dyn MetaItem>) {
-        let key = data.key();
-        let r = self.insert(&key, &data.val());
-        if r.is_err() {
-            log::error!("flush key {} error {}", key, r.err().unwrap().to_string());
-        }
+impl SledStore {
+    pub fn new(meta_path: &str, cache_cap: usize) -> Self {
+        let s = Self {
+            cache: RefCell::new(LRUCache::new(cache_cap)),
+            db: sled::open(meta_path).unwrap(),
+        };
+        // unnecessary to flush, use default dummy backend
+        // let p = std::ptr::addr_of_mut!(s);
+        // s.cache.borrow_mut().set_backend(p);
+        s
     }
 }
 
@@ -46,16 +49,25 @@ impl MetaStore for SledStore {
     fn insert(&self, key: &str, val: &[u8]) -> Result<(), String> {
         match self.db.insert(key, val) {
             Err(e) => Err(e.to_string()),
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.cache.borrow_mut().add(key.to_string(), val.to_vec());
+                Ok(())
+            }
         }
     }
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        if let Some(v) = self.cache.borrow_mut().get(key.to_string()) {
+            return Ok(Some(v.clone()));
+        }
         match self.db.get(key) {
             Err(e) => Err(e.to_string()),
             Ok(o) => match o {
                 None => Ok(None),
-                Some(o) => Ok(Some(o.to_vec())),
+                Some(o) => {
+                    self.cache.borrow_mut().add(key.to_string(), o.to_vec());
+                    Ok(Some(o.to_vec()))
+                }
             },
         }
     }
@@ -69,6 +81,7 @@ impl MetaStore for SledStore {
     }
 
     fn remove(&self, key: &str) -> Result<(), String> {
+        self.cache.borrow_mut().del(key.to_string());
         match self.db.remove(key) {
             Err(e) => Err(e.to_string()),
             Ok(_) => Ok(()),
@@ -76,14 +89,18 @@ impl MetaStore for SledStore {
     }
 
     fn contains_key(&self, key: &str) -> Result<bool, String> {
+        if let Some(_) = self.cache.borrow_mut().get(key.to_string()) {
+            return Ok(true);
+        }
         match self.db.contains_key(key) {
             Err(e) => Err(e.to_string()),
             Ok(o) => Ok(o),
         }
     }
 
-    fn flush(&mut self) {
-        self.cache.flush();
+    fn flush(&self) {
+        // if backend is set to sled, sled will SIGSEGV on `insert`
+        // self.cache.borrow_mut().flush();
         let _r = self.db.flush();
     }
 }

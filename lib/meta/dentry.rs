@@ -1,4 +1,4 @@
-use crate::meta::{Ino, MetaItem};
+use crate::meta::{Ino, MetaKV};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -32,7 +32,7 @@ impl Dentry {
     }
 }
 
-impl MetaItem for Dentry {
+impl MetaKV for Dentry {
     fn key(&self) -> String {
         Self::key(self.parent, &self.name)
     }

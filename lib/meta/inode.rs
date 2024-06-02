@@ -1,4 +1,4 @@
-use super::{Ino, MetaItem};
+use super::{Ino, MetaKV};
 use crate::utils::FS_BLK_SIZE;
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +37,7 @@ impl Inode {
     }
 }
 
-impl MetaItem for Inode {
+impl MetaKV for Inode {
     fn key(&self) -> String {
         Self::key(self.id)
     }

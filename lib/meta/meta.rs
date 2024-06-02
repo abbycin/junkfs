@@ -2,7 +2,7 @@ use crate::meta::dentry::Dentry;
 use crate::meta::inode::{Inode, Itype};
 use crate::meta::sled::SledStore;
 use crate::meta::super_block::SuperBlock;
-use crate::meta::{DirHandle, MetaItem, MetaStore};
+use crate::meta::{DirHandle, MetaKV, MetaStore};
 use crate::utils::{init_data_path, FS_META_CACHE_SIZE};
 use libc::{EEXIST, EFAULT, ENOENT, ENOTEMPTY};
 use std::cell::RefCell;
@@ -17,29 +17,10 @@ pub struct NameT {
 }
 
 pub struct Meta {
-    /// TODO: 实际上cache应该是`Meta`的成员，参与业务逻辑的，但考虑到或许会存在类型转换等问题，暂时将cache放到 `MetaStore` 里面，
-    /// 这样就要求 `MetaStore` 实现者决定缓存的策略，如：该缓存哪些内容、何时淘汰
     pub meta: Box<dyn MetaStore>,
     sb: SuperBlock,
 }
 
-/// Meta Design
-/// this struct impl most fs operations via a kv database including: superblock, inode, dentry
-/// ### superblock
-/// which hold meta info of total inode/data count and used count, the superblock is store as
-/// key => `superblock` value => `SuperBlock`
-/// ### inode
-/// which hold meta info of a file, the most important member is `chunks`, the inode in kv database
-/// has schema: key => `inode_Ino`, value => `chunks` list, the value maybe very large, but it's ok
-/// since we are not for performance, we are to demonstration
-/// ### dentry
-/// it's a `name` to `inode number` map, and this maybe very large too, but we can limit member count
-/// the `dentry`, since the database support range scan operation, we can simply format dentry to kv
-/// store, with same prefix as hash key (in Redis) and the value is inode number, for example, let's
-/// say a dentry's Ino is 3 and a file's Ino is 5 and it's name `foo`, then it should be a kv in db
-/// like `dentry_3_foo` value is `5`, if there's another file name `bar` with Ino `6`, then another
-/// key-value is `dentry_3_bar` -> `6`
-/// ### NOTE: there's no cache support for inode and dentry at present
 impl Meta {
     // write superblock
     pub fn format(meta_path: &str, store_path: &str) -> Result<(), String> {

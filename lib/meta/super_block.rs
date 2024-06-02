@@ -1,4 +1,4 @@
-use crate::meta::{Ino, MetaItem};
+use crate::meta::{Ino, MetaKV};
 use crate::utils::{BitMap, FS_ROOT_INODE, FS_TOTAL_INODES};
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +42,7 @@ impl SuperBlock {
     }
 }
 
-impl MetaItem for SuperBlock {
+impl MetaKV for SuperBlock {
     fn key(&self) -> String {
         Self::key()
     }
