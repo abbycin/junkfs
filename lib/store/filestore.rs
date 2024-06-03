@@ -1,35 +1,68 @@
+use crate::cache::{Flusher, LRUCache};
 use crate::meta::{Ino, Meta};
 use crate::store::{Entry, Store};
 use crate::utils::{get_data_path, FS_BLK_SIZE, FS_FUSE_MAX_IO_SIZE};
+use once_cell::sync::Lazy;
 use std::cmp::{max, min};
-use std::collections::HashMap;
+use std::io::Write;
 use std::os::unix::prelude::FileExt;
+const MAX_CACHE_ITEMS: usize = 256;
 
-pub struct FileStore {
-    w_ofs: HashMap<u64, std::fs::File>, // key is blk_id
-    r_ofs: HashMap<u64, std::fs::File>,
+struct FileFlusher;
+
+static mut G_LUSHER: FileFlusher = FileFlusher;
+
+impl Flusher<String, std::fs::File> for FileFlusher {
+    fn flush(&mut self, key: String, data: std::fs::File) {
+        let mut file = data;
+        file.flush().expect(&format!("can't flush file {}", key));
+        drop(file);
+    }
 }
 
-fn build_path(ino: Ino, blk: u64) -> String {
-    format!("{}/{}/{}", get_data_path(), ino, blk)
+static mut G_FILE_CACHE: Lazy<LRUCache<String, std::fs::File>> = Lazy::new(|| {
+    let mut c = LRUCache::new(MAX_CACHE_ITEMS);
+    let p = unsafe { std::ptr::addr_of_mut!(G_LUSHER) };
+    c.set_backend(p);
+    c
+});
+
+fn cache_add<'a>(key: String, val: std::fs::File) -> Option<&'a mut std::fs::File> {
+    unsafe { G_FILE_CACHE.add(key, val) }
 }
 
-fn build_dir(ino: Ino) -> String {
-    format!("{}/{}", get_data_path(), ino)
+fn cache_get_mut<'a>(key: &String) -> Option<&'a mut std::fs::File> {
+    unsafe { G_FILE_CACHE.get_mut(key) }
+}
+
+pub struct FileStore;
+
+impl Flusher<u64, std::fs::File> for FileStore {
+    fn flush(&mut self, key: u64, data: std::fs::File) {
+        log::warn!("close file {}", key);
+        drop(data);
+    }
 }
 
 impl FileStore {
-    pub fn new() -> Self {
-        Self {
-            w_ofs: HashMap::new(),
-            r_ofs: HashMap::new(),
-        }
+    fn read_key(ino: Ino, blk: u64) -> String {
+        format!("{}r{}", ino, blk)
+    }
+
+    fn write_key(ino: Ino, blk: u64) -> String {
+        format!("{}w{}", ino, blk)
+    }
+
+    fn build_path(ino: Ino, blk: u64) -> String {
+        format!("{}/{}/{}", get_data_path(), ino, blk)
+    }
+
+    fn build_dir(ino: Ino) -> String {
+        format!("{}/{}", get_data_path(), ino)
     }
 
     pub fn unlink(ino: Ino, blk_id: u64) {
-        let p = build_path(ino, blk_id);
-        // it's not necessary to remove key from ofs, since the whole FileStore
-        // will be dropped after `unlink``
+        let p = Self::build_path(ino, blk_id);
         match std::fs::remove_file(&p) {
             Err(e) => {
                 log::error!("can't remove {} error {}", p, e);
@@ -40,14 +73,15 @@ impl FileStore {
         }
     }
 
-    fn get_fp<'a, 'b>(m: &'a mut HashMap<u64, std::fs::File>, ino: Ino, key: u64) -> Option<&'b mut std::fs::File>
+    fn get_fp<'a, 'b>(key: String, ino: Ino, blk: u64) -> Option<&'b mut std::fs::File>
     where
         'a: 'b,
     {
-        let tmp = m.contains_key(&key);
-        if !tmp {
-            let _ = std::fs::create_dir_all(&build_dir(ino));
-            let fpath = build_path(ino, key);
+        if let Some(tmp) = cache_get_mut(&key) {
+            Some(tmp)
+        } else {
+            let _ = std::fs::create_dir_all(&Self::build_dir(ino));
+            let fpath = Self::build_path(ino, blk);
             // NOTE: do NOT use append, see `File::write_at` doc `pwrite64` bug
             let f = std::fs::File::options()
                 .create(true)
@@ -58,16 +92,15 @@ impl FileStore {
                 log::error!("can't create {}", fpath);
                 return None;
             }
-            m.insert(key, f.unwrap());
-            return m.get_mut(&key);
-        } else {
-            m.get_mut(&key)
+            cache_add(key, f.unwrap())
         }
     }
     fn write_impl(&mut self, ino: Ino, e: &Entry) -> bool {
-        let fp = Self::get_fp(&mut self.w_ofs, ino, e.blk_id);
+        let key = Self::write_key(ino, e.blk_id);
+        let fp = Self::get_fp(key, ino, e.blk_id);
 
         if fp.is_none() {
+            log::error!("can't open file {}_{}", ino, e.blk_id);
             return false;
         }
 
@@ -85,8 +118,10 @@ impl FileStore {
 
     fn read_impl(&mut self, ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {
         let blk_id = off / FS_BLK_SIZE;
-        let fp = Self::get_fp(&mut self.r_ofs, ino, blk_id);
+        let key = Self::read_key(ino, blk_id);
+        let fp = Self::get_fp(key, ino, blk_id);
         if fp.is_none() {
+            log::error!("can't open file for read {}_{}", ino, blk_id);
             return None;
         }
         let fp = fp.unwrap();
@@ -129,6 +164,7 @@ impl Store for FileStore {
                 sz
             );
             if !self.write_impl(ino, e) {
+                log::warn!("write {}_{} fail", ino, e.blk_id);
                 return;
             }
         }

@@ -5,6 +5,6 @@ pub use pool::MemPool;
 
 pub use lru::LRUCache;
 
-pub trait Store<K, V> {
-    fn store(&mut self, key: K, data: V);
+pub trait Flusher<K, V> {
+    fn flush(&mut self, key: K, data: V);
 }

@@ -17,7 +17,7 @@ impl CacheStore {
         Self {
             ino,
             bufs: Vec::new(),
-            store: Box::new(FileStore::new()),
+            store: Box::new(FileStore),
         }
     }
 

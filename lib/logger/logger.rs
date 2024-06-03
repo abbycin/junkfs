@@ -200,14 +200,8 @@ mod test {
     fn test_console() {
         let l = Logger::init();
 
-        assert_eq!(1, 1);
         let p = log::logger() as *const dyn log::Log;
         let q = &*l as *const dyn log::Log;
-        println!("{:?} {:?} equal {}", p, q, std::ptr::addr_eq(p, q));
-
-        l.add_console();
-
-        log::warn!("hello world!");
-        log::trace!("fuck");
+        assert!(std::ptr::addr_eq(p, q));
     }
 }

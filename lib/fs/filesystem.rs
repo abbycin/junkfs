@@ -43,7 +43,7 @@ impl Fs {
     }
 
     pub fn flush_sb(&self) {
-        self.meta.flush_sb();
+        self.meta.flush_sb().expect("can't flush sb");
     }
 
     fn new_file_handle(&mut self, ino: Ino) -> Option<Rc<RefCell<FileHandle>>> {
@@ -91,6 +91,7 @@ impl Fs {
     fn remove_file_handle(&mut self, ino: Ino, fh: u64) {
         let h = Self::find_handle(ino, fh, &self.store).expect("fh not found");
         h.borrow_mut().flush(&mut self.meta);
+        Self::remove_handle(ino, fh, &self.store);
         let ok = self.hmap.free(fh);
         assert!(ok);
     }
@@ -152,7 +153,7 @@ impl Filesystem for Fs {
             let attr = to_attr(&inode);
             reply.entry(&ttl, &attr, 0);
         } else {
-            log::warn!("lookup fail parent {} name {}", parent, name);
+            log::info!("lookup fail parent {} name {}", parent, name);
             reply.error(ENOENT);
         }
     }
@@ -389,7 +390,7 @@ impl Filesystem for Fs {
             let mut off = h.borrow().off() as i64;
             while let Some(i) = h.borrow_mut().next() {
                 if reply.add(ino, off, to_filetype(i.kind), &i.name) {
-                    log::warn!("add dentry buffer full, current entry {} offset {}", i.name, off);
+                    log::info!("add dentry buffer full, current entry {} offset {}", i.name, off);
                     break;
                 }
                 off += 1;

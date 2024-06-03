@@ -1,6 +1,6 @@
 use std::{collections::HashMap, hash::Hash};
 
-use super::Store;
+use super::Flusher;
 
 struct Node<K, V> {
     key: Option<K>,
@@ -36,8 +36,8 @@ impl<K, V> Default for Node<K, V> {
 
 struct Dummy {}
 
-impl<K, V> Store<K, V> for Dummy {
-    fn store(&mut self, _key: K, _data: V) {}
+impl<K, V> Flusher<K, V> for Dummy {
+    fn flush(&mut self, _key: K, _data: V) {}
 }
 
 static mut G_DUMMY: Dummy = Dummy {};
@@ -45,7 +45,7 @@ static mut G_DUMMY: Dummy = Dummy {};
 pub struct LRUCache<K, V> {
     head: *mut Node<K, V>,
     map: HashMap<K, *mut Node<K, V>>,
-    backend: *mut dyn Store<K, V>,
+    backend: *mut dyn Flusher<K, V>,
     cap: usize,
     size: usize,
 }
@@ -70,11 +70,12 @@ where
     }
 
     #[allow(unused)]
-    pub fn set_backend(&mut self, b: *mut dyn Store<K, V>) {
+    pub fn set_backend(&mut self, b: *mut dyn Flusher<K, V>) {
         self.backend = b;
     }
 
-    pub fn add(&mut self, key: K, val: V) {
+    pub fn add(&mut self, key: K, val: V) -> Option<&mut V> {
+        let r;
         let e = self.map.get(&key);
         if e.is_none() {
             let node = Box::new(Node::new(key.clone(), val));
@@ -82,12 +83,14 @@ where
             self.map.insert(key, p);
             self.push_back(p);
             self.size += 1;
+            r = unsafe { (*p).val.as_mut() }
         } else {
             let e = e.unwrap();
             unsafe {
                 (*(*e)).set_val(val);
             }
             self.move_back(*e);
+            r = unsafe { (*(*e)).val.as_mut() }
         }
 
         if self.size > self.cap {
@@ -98,28 +101,36 @@ where
                 self.map.remove(&key);
                 self.remove_node(node);
                 let val = (*node).val.take();
-                (*self.backend).store(key, val.unwrap());
+                (*self.backend).flush(key, val.unwrap());
                 let _ = Box::from_raw(node);
             }
         }
+        r
     }
 
-    pub fn get(&mut self, key: K) -> Option<&V> {
-        if !self.map.contains_key(&key) {
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        if !self.map.contains_key(key) {
             return None;
         }
 
-        let tmp = self.map.get(&key).unwrap();
-        unsafe {
-            self.move_back(*tmp);
-            (*(*tmp)).val.as_ref()
-        }
+        let tmp = self.map.get(key).unwrap();
+        self.move_back(*tmp);
+        unsafe { (*(*tmp)).val.as_ref() }
     }
 
-    pub fn del(&mut self, key: K) {
-        if let Some(node) = self.map.get(&key) {
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        if !self.map.contains_key(key) {
+            return None;
+        }
+        let tmp = self.map.get(&key).unwrap();
+        self.move_back(*tmp);
+        unsafe { (*(*tmp)).val.as_mut() }
+    }
+
+    pub fn del(&mut self, key: &K) {
+        if let Some(node) = self.map.get(key) {
             self.remove_node(*node);
-            self.map.remove(&key);
+            self.map.remove(key);
             self.size -= 1;
         }
     }
@@ -133,7 +144,7 @@ where
                 let key = (*p).key.take().unwrap();
                 self.map.remove(&key);
                 let tmp = (*p).val.take();
-                (*self.backend).store(key, tmp.unwrap());
+                (*self.backend).flush(key, tmp.unwrap());
                 let _ = Box::from_raw(p);
                 p = prev;
                 self.size -= 1;
@@ -181,7 +192,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::cache::Store;
+    use crate::cache::Flusher;
 
     use super::LRUCache;
     use std::cell::RefCell;
@@ -191,8 +202,8 @@ mod test {
         data: Rc<RefCell<Vec<i32>>>,
     }
 
-    impl Store<i32, i32> for Backend {
-        fn store(&mut self, _k: i32, v: i32) {
+    impl Flusher<i32, i32> for Backend {
+        fn flush(&mut self, _k: i32, v: i32) {
             self.data.borrow_mut().push(v);
         }
     }
@@ -217,15 +228,15 @@ mod test {
 
         assert_eq!(lru.len(), cap);
 
-        lru.del(4);
+        lru.del(&4);
         assert_eq!(lru.len(), cap - 1);
 
         assert_eq!(q.borrow().len(), 1);
 
-        assert_eq!(lru.get(1), None);
-        assert_eq!(lru.get(2), Some(&2));
-        assert_eq!(lru.get(3), Some(&3));
-        assert_eq!(lru.get(4), None);
+        assert_eq!(lru.get(&1), None);
+        assert_eq!(lru.get(&2), Some(&2));
+        assert_eq!(lru.get(&3), Some(&3));
+        assert_eq!(lru.get(&4), None);
 
         lru.flush();
 

@@ -1,4 +1,4 @@
-use crate::cache::{LRUCache, Store};
+use crate::cache::{Flusher, LRUCache};
 use crate::meta::meta_store::{MetaIter, MetaStore};
 use sled::IVec;
 use std::cell::RefCell;
@@ -21,8 +21,8 @@ fn tranform_iter<T: Iterator<Item = Result<(IVec, IVec), sled::Error>>>(
     })
 }
 
-impl Store<String, Vec<u8>> for SledStore {
-    fn store(&mut self, key: String, data: Vec<u8>) {
+impl Flusher<String, Vec<u8>> for SledStore {
+    fn flush(&mut self, key: String, data: Vec<u8>) {
         match self.db.insert(&key, data.as_slice()) {
             Err(e) => {
                 log::error!("can't store key {} error {}", key, e.to_string());
@@ -48,7 +48,10 @@ impl SledStore {
 impl MetaStore for SledStore {
     fn insert(&self, key: &str, val: &[u8]) -> Result<(), String> {
         match self.db.insert(key, val) {
-            Err(e) => Err(e.to_string()),
+            Err(e) => {
+                log::error!("insert {} fail, error {}", key, e);
+                Err(e.to_string())
+            }
             Ok(_) => {
                 self.cache.borrow_mut().add(key.to_string(), val.to_vec());
                 Ok(())
@@ -57,11 +60,14 @@ impl MetaStore for SledStore {
     }
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        if let Some(v) = self.cache.borrow_mut().get(key.to_string()) {
+        if let Some(v) = self.cache.borrow_mut().get(&key.to_string()) {
             return Ok(Some(v.clone()));
         }
         match self.db.get(key) {
-            Err(e) => Err(e.to_string()),
+            Err(e) => {
+                log::error!("get {} fail, error {}", key, e);
+                Err(e.to_string())
+            }
             Ok(o) => match o {
                 None => Ok(None),
                 Some(o) => {
@@ -81,19 +87,25 @@ impl MetaStore for SledStore {
     }
 
     fn remove(&self, key: &str) -> Result<(), String> {
-        self.cache.borrow_mut().del(key.to_string());
+        self.cache.borrow_mut().del(&key.to_string());
         match self.db.remove(key) {
-            Err(e) => Err(e.to_string()),
+            Err(e) => {
+                log::error!("remove {} fail, error {}", key, e);
+                Err(e.to_string())
+            }
             Ok(_) => Ok(()),
         }
     }
 
     fn contains_key(&self, key: &str) -> Result<bool, String> {
-        if let Some(_) = self.cache.borrow_mut().get(key.to_string()) {
+        if let Some(_) = self.cache.borrow_mut().get(&key.to_string()) {
             return Ok(true);
         }
         match self.db.contains_key(key) {
-            Err(e) => Err(e.to_string()),
+            Err(e) => {
+                log::error!("contains_key {} fail, error {}", key, e);
+                Err(e.to_string())
+            }
             Ok(o) => Ok(o),
         }
     }

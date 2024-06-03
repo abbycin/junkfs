@@ -84,10 +84,14 @@ impl Meta {
         self.meta.flush();
     }
 
-    pub fn flush_sb(&self) {
-        self.meta
-            .insert(&SuperBlock::key(), &self.sb.val())
-            .expect("can't store kv");
+    pub fn flush_sb(&self) -> Result<(), String> {
+        match self.meta.insert(&SuperBlock::key(), &self.sb.val()) {
+            Err(e) => {
+                log::error!("can't flush superblock, error {}", e);
+                Err(e.to_string())
+            }
+            Ok(_) => Ok(()),
+        }
     }
 
     /// - use `parent` and `name` to build dentry key
@@ -103,7 +107,7 @@ impl Meta {
             }
             Ok(dentry) => {
                 if dentry.is_none() {
-                    log::warn!("can't find dentry {}", parent);
+                    log::info!("can't find dentry {}", parent);
                     return None;
                 }
                 let dentry = dentry.unwrap();
@@ -161,7 +165,6 @@ impl Meta {
                 return Err(EFAULT);
             }
 
-            self.flush_sb();
             Ok(inode)
         } else {
             Err(ENOENT)
@@ -187,7 +190,6 @@ impl Meta {
         self.delete_key(&ikey).unwrap();
         self.delete_key(&dkey).unwrap();
         self.sb.free_ino(inode.id);
-        self.flush_sb();
         Ok(inode)
     }
 
