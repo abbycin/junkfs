@@ -9,7 +9,7 @@ pub struct SledStore {
     db: sled::Db,
 }
 
-fn tranform_iter<T: Iterator<Item = Result<(IVec, IVec), sled::Error>>>(
+fn transform_iter<T: Iterator<Item = Result<(IVec, IVec), sled::Error>>>(
     iter: T,
 ) -> impl Iterator<Item = Option<Vec<u8>>> {
     iter.map(|x| match x {
@@ -82,7 +82,7 @@ impl MetaStore for SledStore {
         let iter = self.db.scan_prefix(prefix);
 
         MetaIter {
-            iter: Box::new(tranform_iter(iter)),
+            iter: Box::new(transform_iter(iter)),
         }
     }
 
@@ -114,5 +114,12 @@ impl MetaStore for SledStore {
         // if backend is set to sled, sled will SIGSEGV on `insert`
         // self.cache.borrow_mut().flush();
         let _r = self.db.flush();
+    }
+}
+
+impl Drop for SledStore {
+    fn drop(&mut self) {
+        self.cache.borrow_mut().flush();
+        let _ = self.db.flush();
     }
 }

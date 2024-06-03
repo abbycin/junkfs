@@ -52,6 +52,8 @@ impl Meta {
                     match sb {
                         Err(e) => Err(e.to_string()),
                         Ok(sb) => {
+                            // TODO: check consistency
+                            sb.check();
                             init_data_path(sb.uri());
                             Ok(Meta { meta, sb })
                         }
@@ -165,6 +167,7 @@ impl Meta {
                 return Err(EFAULT);
             }
 
+            let _ = self.flush_sb();
             Ok(inode)
         } else {
             Err(ENOENT)
@@ -190,6 +193,7 @@ impl Meta {
         self.delete_key(&ikey).unwrap();
         self.delete_key(&dkey).unwrap();
         self.sb.free_ino(inode.id);
+        let _ = self.flush_sb();
         Ok(inode)
     }
 

@@ -42,7 +42,7 @@ impl<K, V> Flusher<K, V> for Dummy {
 
 static mut G_DUMMY: Dummy = Dummy {};
 
-pub struct LRUCache<K, V> {
+pub struct LRUCache<K: Eq + Hash + Clone, V> {
     head: *mut Node<K, V>,
     map: HashMap<K, *mut Node<K, V>>,
     backend: *mut dyn Flusher<K, V>,
@@ -52,7 +52,7 @@ pub struct LRUCache<K, V> {
 
 impl<K, V> LRUCache<K, V>
 where
-    K: Default + Eq + Hash + Clone,
+    K: Eq + Hash + Clone,
 {
     pub fn new(cap: usize) -> Self {
         let p = Box::into_raw(Box::new(Node::default()));
@@ -128,9 +128,11 @@ where
     }
 
     pub fn del(&mut self, key: &K) {
-        if let Some(node) = self.map.get(key) {
-            self.remove_node(*node);
-            self.map.remove(key);
+        if let Some(node) = self.map.remove(key) {
+            self.remove_node(node);
+            unsafe {
+                let _ = Box::from_raw(node);
+            }
             self.size -= 1;
         }
     }
@@ -138,15 +140,14 @@ where
     #[allow(unused)]
     pub fn flush(&mut self) {
         unsafe {
-            let mut p = (*self.head).prev;
-            while !p.eq(&self.head) {
-                let prev = (*p).prev;
-                let key = (*p).key.take().unwrap();
+            while self.size > 0 {
+                let node = self.front();
+                self.remove_node(node);
+                let key = (*node).key.take().unwrap();
                 self.map.remove(&key);
-                let tmp = (*p).val.take();
-                (*self.backend).flush(key, tmp.unwrap());
-                let _ = Box::from_raw(p);
-                p = prev;
+                let val = (*node).val.take();
+                (*self.backend).flush(key, val.unwrap());
+                let _ = Box::from_raw(node);
                 self.size -= 1;
             }
         }
@@ -187,6 +188,27 @@ where
     fn move_back(&self, node: *mut Node<K, V>) {
         self.remove_node(node);
         self.push_back(node);
+    }
+}
+
+impl<K, V> Drop for LRUCache<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    fn drop(&mut self) {
+        let mut nodes = 1 + self.size; // including dummy head
+        unsafe {
+            let mut p = (*self.head).next;
+            (*self.head).next = std::ptr::null_mut();
+            while !p.is_null() {
+                let prev = (*p).next;
+                let _ = Box::from_raw(p);
+                p = prev;
+                nodes -= 1;
+                log::warn!("drop cache {}", nodes);
+            }
+        }
+        assert_eq!(nodes, 0);
     }
 }
 
@@ -246,5 +268,8 @@ mod test {
         assert_eq!(q.borrow()[2], 3);
 
         assert_eq!(lru.len(), 0);
+
+        lru.add(5, 5);
+        assert_eq!(lru.len(), 1);
     }
 }

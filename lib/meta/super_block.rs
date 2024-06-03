@@ -17,7 +17,7 @@ impl SuperBlock {
         SuperBlock {
             ino: FS_ROOT_INODE,
             uri: uri.to_string(),
-            imap: BitMap::new(FS_TOTAL_INODES as u64),
+            imap: BitMap::new(FS_TOTAL_INODES),
         }
     }
 
@@ -29,8 +29,24 @@ impl SuperBlock {
         &self.uri
     }
 
+    pub fn check(&self) {
+        assert_eq!(self.imap.cap(), FS_TOTAL_INODES);
+        let mut cnt = 0;
+
+        for i in 0..FS_TOTAL_INODES {
+            if self.imap.test(i) {
+                cnt += 1;
+            }
+        }
+        assert_eq!(cnt, self.imap.len());
+    }
+
     pub fn free_ino(&mut self, ino: Ino) {
-        self.imap.del(ino);
+        if self.imap.test(ino) {
+            self.imap.del(ino);
+        } else {
+            log::error!("non existed ino {}", ino);
+        }
     }
 
     pub fn key() -> String {
@@ -49,5 +65,44 @@ impl MetaKV for SuperBlock {
 
     fn val(&self) -> Vec<u8> {
         Self::val(self)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::meta::super_block::SuperBlock;
+    use crate::meta::MetaKV;
+
+    #[test]
+    fn test_superblock() {
+        let mut sb = SuperBlock::new("tmp");
+
+        sb.alloc_ino();
+        sb.alloc_ino();
+        sb.alloc_ino();
+
+        assert_eq!(sb.imap.len(), 3);
+
+        // let tmp = SuperBlock::val(&sb);
+        let tmp = sb.val();
+
+        let bs = bincode::deserialize::<SuperBlock>(tmp.as_slice()).unwrap();
+
+        assert_eq!(bs.imap.len(), 3);
+
+        let path = "/tmp/test_sb";
+        let _ = std::fs::remove_dir_all(path);
+        let _ = std::fs::create_dir_all(path);
+        let db = sled::open(path).unwrap();
+
+        let _ = db.insert("sb", tmp);
+
+        let tmp = db.get("sb").unwrap().unwrap();
+        let bs = bincode::deserialize::<SuperBlock>(tmp.as_ref()).unwrap();
+
+        assert_eq!(bs.imap.len(), sb.imap.len());
+        assert!(bs.imap.test(0));
+        assert!(bs.imap.test(1));
+        assert!(bs.imap.test(2));
     }
 }

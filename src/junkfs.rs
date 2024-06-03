@@ -1,17 +1,21 @@
 use junkfs::fs::Fs;
 use junkfs::logger::Logger;
 use libc::{sighandler_t, SIGINT, SIGTERM};
+use std::str::FromStr;
 
 fn main() {
+    let level = std::env::var("JUNK_LEVEL")
+        .or::<String>(Ok("WARN".to_string()))
+        .unwrap();
     let log_path = "/tmp/junkfs.log";
     Logger::init().add_file(&log_path, true);
-    log::set_max_level(log::LevelFilter::Warn);
+    log::set_max_level(log::LevelFilter::from_str(&level).unwrap());
     if std::env::args().len() != 3 {
         eprintln!("{} meta_path mount_point", std::env::args().nth(0).unwrap());
         std::process::exit(1);
     }
 
-    println!("log write to {}", log_path);
+    println!("log write to {} level {}", log_path, level);
     let meta_path = std::env::args().nth(1).unwrap();
     let mount_point = std::env::args().nth(2).unwrap();
 
