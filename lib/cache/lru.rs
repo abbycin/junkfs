@@ -205,7 +205,6 @@ where
                 let _ = Box::from_raw(p);
                 p = prev;
                 nodes -= 1;
-                log::warn!("drop cache {}", nodes);
             }
         }
         assert_eq!(nodes, 0);

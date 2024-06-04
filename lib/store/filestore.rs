@@ -28,7 +28,6 @@ static mut G_FILE_CACHE: Lazy<LRUCache<String, std::fs::File>> = Lazy::new(|| {
 });
 
 fn cache_add<'a>(key: String, val: std::fs::File) -> Option<&'a mut std::fs::File> {
-    log::warn!("add cache {}", key);
     unsafe { G_FILE_CACHE.add(key, val) }
 }
 
