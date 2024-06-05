@@ -123,7 +123,7 @@ impl Fs {
 
 impl Filesystem for Fs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let mut name = name.to_str().unwrap().to_string();
+        let mut name = name.to_string_lossy().to_string();
         let ttl = time::Duration::new(1, 0);
 
         if name == ".." {
@@ -412,7 +412,7 @@ impl Filesystem for Fs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        let name = name.to_str().unwrap().to_string();
+        let name = name.to_string_lossy().to_string();
         log::info!("mknod parent {} name {}", parent, name);
 
         if mode & S_IFMT != S_IFREG {
@@ -435,7 +435,7 @@ impl Filesystem for Fs {
     }
 
     fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
-        let name = name.to_str().unwrap().to_string();
+        let name = name.to_string_lossy().to_string();
 
         log::info!("mkdir parent {} name {}", parent, name);
         match self.meta.mknod(parent, &name, Itype::Dir, mode) {
@@ -462,7 +462,7 @@ impl Filesystem for Fs {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let name = name.to_str().unwrap().to_string();
+        let name = name.to_string_lossy().to_string();
         log::info!("create parent {} name {} flags {} mask {}", parent, name, flags, umask);
         let r = self.meta.mknod(parent, &name, Itype::File, mode);
         if r.is_err() {
