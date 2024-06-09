@@ -2,8 +2,10 @@ use junkfs::fs::Fs;
 use junkfs::logger::Logger;
 use libc::{sighandler_t, SIGINT, SIGTERM};
 use std::str::FromStr;
+use tokio::signal::unix::{signal, SignalKind};
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let level = std::env::var("JUNK_LEVEL")
         .or::<String>(Ok("WARN".to_string()))
         .unwrap();
@@ -19,8 +21,6 @@ fn main() {
     let meta_path = std::env::args().nth(1).unwrap();
     let mount_point = std::env::args().nth(2).unwrap();
 
-    setup_signal_handler();
-
     let junkfs = Fs::new(meta_path);
     match junkfs {
         Err(e) => {
@@ -32,41 +32,15 @@ fn main() {
                 fuser::MountOption::FSName("jfs".to_string()),
                 fuser::MountOption::Subtype("jfs".to_string()),
             ];
-            // let session = fuser::spawn_mount2(junkfs, &mount_point, &options).expect("can't mount");
-            // wait_signal();
-            // session.join();
+            let session = fuser::spawn_mount2(junkfs, &mount_point, &options).expect("can't mount");
+            let mut sig_int = signal(SignalKind::interrupt())?;
+            let mut sig_term = signal(SignalKind::terminate())?;
 
-            let r = fuser::mount2(junkfs, &mount_point, &options);
-            match r {
-                Err(e) => {
-                    log::error!("mount fail, error {}", e.to_string());
-                    std::process::exit(1);
-                }
-                Ok(()) => {}
+            tokio::select! {
+                _ = sig_int.recv() => session.join(),
+                _ = sig_term.recv() => session.join(),
             }
         }
     }
-}
-
-static mut IS_QUIT: bool = false;
-
-extern "C" fn handle_signal(_sig: i32) {
-    unsafe {
-        IS_QUIT = true;
-    }
-}
-
-fn setup_signal_handler() {
-    unsafe {
-        let handler = handle_signal as sighandler_t;
-        libc::signal(SIGTERM, handler);
-        libc::signal(SIGINT, handler);
-    }
-}
-
-#[allow(dead_code)]
-fn wait_signal() {
-    unsafe {
-        libc::pause();
-    }
+    Ok(())
 }
