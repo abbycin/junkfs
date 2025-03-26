@@ -6,19 +6,19 @@ use std::ptr::addr_of_mut;
 use std::sync::Mutex;
 
 thread_local! {
-    static G_TID: Cell<i32> = Cell::new(0);
+    static G_TID: Cell<i32> = const { Cell::new(0) };
 }
 static mut G_LOGGER: Logger = Logger { sink: Vec::new() };
 
-const G_CONSOLE: &'static str = "console";
-const G_FILE: &'static str = "file";
+const G_CONSOLE: &str = "console";
+const G_FILE: &str = "file";
 
 fn get_tid() -> i32 {
     unsafe {
         if G_TID.get() == 0 {
             G_TID.set(libc::gettid());
         }
-        return G_TID.get();
+        G_TID.get()
     }
 }
 
@@ -28,7 +28,7 @@ pub struct Logger {
 }
 
 trait Sink: Send + Sync {
-    fn sink(&mut self, str: &String);
+    fn sink(&mut self, str: &str);
 
     fn flush(&mut self);
 
@@ -37,7 +37,7 @@ trait Sink: Send + Sync {
 
 impl log::Log for Logger {
     fn enabled(&self, _metadata: &Metadata) -> bool {
-        return true;
+        true
     }
 
     fn log(&self, record: &Record) {
@@ -97,8 +97,8 @@ impl File {
 }
 
 impl Sink for Console {
-    fn sink(&mut self, str: &String) {
-        std::io::stdout().write(str.as_bytes()).unwrap();
+    fn sink(&mut self, str: &str) {
+        std::io::stdout().write_all(str.as_bytes()).unwrap();
     }
 
     fn flush(&mut self) {
@@ -111,8 +111,8 @@ impl Sink for Console {
 }
 
 impl Sink for File {
-    fn sink(&mut self, str: &String) {
-        self.w.write(str.as_bytes()).unwrap();
+    fn sink(&mut self, str: &str) {
+        self.w.write_all(str.as_bytes()).unwrap();
     }
 
     fn flush(&mut self) {
@@ -128,13 +128,13 @@ impl Logger {
     pub fn init() -> &'static mut Self {
         log::set_logger(Self::get()).unwrap();
         log::set_max_level(LevelFilter::Trace);
-        return Self::get();
+        Self::get()
     }
 
     pub fn get() -> &'static mut Self {
         unsafe {
             let a = addr_of_mut!(G_LOGGER);
-            return &mut *a;
+            &mut *a
         }
     }
 
@@ -144,7 +144,7 @@ impl Logger {
                 return Some(Self::get());
             }
         }
-        return None;
+        None
     }
 
     pub fn add_console(&mut self) -> &mut Self {
@@ -158,11 +158,7 @@ impl Logger {
         if self.exist(G_FILE).is_none() {
             match File::new(&path, trunc) {
                 Err(e) => {
-                    eprintln!(
-                        "can't open {}, error {}",
-                        path.as_ref().to_str().unwrap(),
-                        e.to_string()
-                    );
+                    eprintln!("can't open {}, error {}", path.as_ref().to_str().unwrap(), e);
                     return None;
                 }
                 Ok(f) => {

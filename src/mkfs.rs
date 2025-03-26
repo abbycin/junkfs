@@ -2,7 +2,7 @@ use junkfs::meta::Meta;
 
 fn main() {
     if std::env::args().len() != 3 {
-        eprintln!("{} meta_path store_path", std::env::args().nth(0).unwrap());
+        eprintln!("{} meta_path store_path", std::env::args().next().unwrap());
         std::process::exit(1);
     }
 

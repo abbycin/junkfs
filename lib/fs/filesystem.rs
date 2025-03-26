@@ -138,7 +138,7 @@ impl Filesystem for Fs {
                             reply.error(ENOTDIR);
                         } else {
                             let attr = &to_attr(&inode);
-                            reply.entry(&ttl, &attr, 0);
+                            reply.entry(&ttl, attr, 0);
                         }
                         return;
                     }
@@ -187,7 +187,7 @@ impl Filesystem for Fs {
             log::info!("load root inode {} ok", inode.id);
             Ok(())
         } else {
-            match self.meta.mknod(0, "/".to_string(), Itype::Dir, 0o755) {
+            match self.meta.mknod(0, "/", Itype::Dir, 0o755) {
                 Err(e) => {
                     log::error!("create root inode fail, error {}", e);
                     Err(e)
@@ -239,7 +239,7 @@ impl Filesystem for Fs {
                     Ok(()) => {
                         let ttl = time::Duration::new(1, 0);
                         let attr = &to_attr(&inode);
-                        reply.attr(&ttl, &attr);
+                        reply.attr(&ttl, attr);
                     }
                     Err(e) => {
                         log::error!("can't store inode {} error {}", inode.id, e);

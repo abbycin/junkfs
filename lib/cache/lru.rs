@@ -122,7 +122,7 @@ where
         if !self.map.contains_key(key) {
             return None;
         }
-        let tmp = self.map.get(&key).unwrap();
+        let tmp = self.map.get(key).unwrap();
         self.move_back(*tmp);
         unsafe { (*(*tmp)).val.as_mut() }
     }

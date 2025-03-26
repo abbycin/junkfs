@@ -1,19 +1,16 @@
 use junkfs::fs::Fs;
 use junkfs::logger::Logger;
-use libc::{sighandler_t, SIGINT, SIGTERM};
 use std::str::FromStr;
 use tokio::signal::unix::{signal, SignalKind};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let level = std::env::var("JUNK_LEVEL")
-        .or::<String>(Ok("WARN".to_string()))
-        .unwrap();
+    let level = std::env::var("JUNK_LEVEL").unwrap_or("WARN".to_string());
     let log_path = "/tmp/junkfs.log";
-    Logger::init().add_file(&log_path, true);
+    Logger::init().add_file(log_path, true);
     log::set_max_level(log::LevelFilter::from_str(&level).unwrap());
     if std::env::args().len() != 3 {
-        eprintln!("{} meta_path mount_point", std::env::args().nth(0).unwrap());
+        eprintln!("{} meta_path mount_point", std::env::args().next().unwrap());
         std::process::exit(1);
     }
 

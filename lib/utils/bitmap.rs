@@ -9,7 +9,7 @@ pub struct BitMap {
 }
 
 const fn roundup_align8(size: u64) -> u64 {
-    align_up(size, 8) as u64
+    align_up(size, 8)
 }
 
 impl BitMap {
@@ -32,15 +32,11 @@ impl BitMap {
 
         self.data[(bit >> 3) as usize] |= 1 << (bit & 7);
         self.count += 1;
-        return true;
+        true
     }
 
     pub fn test(&self, bit: u64) -> bool {
-        if (self.data[(bit >> 3) as usize] & (1 << (bit & 7))) != 0 {
-            true
-        } else {
-            false
-        }
+        (self.data[(bit >> 3) as usize] & (1 << (bit & 7))) != 0
     }
 
     pub fn del(&mut self, bit: u64) {
@@ -79,7 +75,7 @@ impl BitMap {
             return false;
         }
         self.del(bit);
-        return true;
+        true
     }
 }
 

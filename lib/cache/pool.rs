@@ -43,9 +43,7 @@ impl MemPool {
 
     pub fn alloc(&mut self) -> *mut u8 {
         if let Some(x) = self.dmap.alloc() {
-            unsafe {
-                return self.ptr.add((x * FS_PAGE_SIZE) as usize);
-            }
+            unsafe { self.ptr.add((x * FS_PAGE_SIZE) as usize) }
         } else {
             std::ptr::null_mut()
         }

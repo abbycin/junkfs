@@ -70,6 +70,7 @@ impl MetaKV for SuperBlock {
 
 #[cfg(test)]
 mod test {
+    use crate::meta::kvstore::MaceStore;
     use crate::meta::super_block::SuperBlock;
     use crate::meta::MetaKV;
 
@@ -93,11 +94,12 @@ mod test {
         let path = "/tmp/test_sb";
         let _ = std::fs::remove_dir_all(path);
         let _ = std::fs::create_dir_all(path);
-        let db = sled::open(path).unwrap();
+        let db = MaceStore::new(path, 1024);
 
-        let _ = db.insert("sb", tmp);
+        let x = db.insert("sb", &tmp);
+        println!("{:?}, tmp.len {:?}", x, tmp.len());
 
-        let tmp = db.get("sb").unwrap().unwrap();
+        let tmp = db.get("sb").unwrap();
         let bs = bincode::deserialize::<SuperBlock>(tmp.as_ref()).unwrap();
 
         assert_eq!(bs.imap.len(), sb.imap.len());

@@ -1,10 +1,11 @@
 use crate::meta::dentry::Dentry;
 use crate::meta::inode::{Inode, Itype};
-use crate::meta::sled::SledStore;
+use crate::meta::kvstore::MaceStore;
 use crate::meta::super_block::SuperBlock;
-use crate::meta::{DirHandle, MetaKV, MetaStore};
+use crate::meta::{DirHandle, MetaKV};
 use crate::utils::{init_data_path, FS_META_CACHE_SIZE};
 use libc::{EEXIST, EFAULT, ENOENT, ENOTEMPTY};
+use mace::{Mace, OpCode, Options};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,49 +18,50 @@ pub struct NameT {
 }
 
 pub struct Meta {
-    pub meta: Box<dyn MetaStore>,
+    pub meta: MaceStore,
     sb: SuperBlock,
 }
 
 impl Meta {
     // write superblock
     pub fn format(meta_path: &str, store_path: &str) -> Result<(), String> {
-        let db = sled::open(meta_path);
+        let mut opt = Options::new(meta_path);
+        opt.page_size = 256 << 10;
+        let db = Mace::new(opt);
         if db.is_err() {
-            return Err(db.err().unwrap().to_string());
+            return Err(format!("{:?}", db.err()));
         }
 
         let db = db.unwrap();
         let sb = SuperBlock::new(store_path);
-        let r = db.insert(SuperBlock::key(), sb.val());
+        let kv = db.begin().unwrap();
+        let r = kv.put(SuperBlock::key(), sb.val());
 
-        match r {
-            Err(e) => Err(e.to_string()),
-            Ok(_) => Ok(()),
+        if r.is_err() {
+            return Err(format!("{:?}", r.err()));
         }
+        kv.commit().map_err(|e| e.to_string())
     }
 
     pub fn load_fs(path: String) -> Result<Self, String> {
-        let meta = Box::new(SledStore::new(&path, FS_META_CACHE_SIZE));
+        let meta = MaceStore::new(&path, FS_META_CACHE_SIZE);
         let sb = meta.get(&SuperBlock::key());
         match sb {
-            Err(e) => Err(e),
-            Ok(sb) => match sb {
-                None => Err("not formated".to_string()),
-                Some(sb) => {
-                    let sb = bincode::deserialize::<SuperBlock>(&sb);
+            Err(OpCode::NotFound) => Err("not formated".to_string()),
+            Err(e) => Err(e.to_string()),
+            Ok(sb) => {
+                let sb = bincode::deserialize::<SuperBlock>(&sb);
 
-                    match sb {
-                        Err(e) => Err(e.to_string()),
-                        Ok(sb) => {
-                            // TODO: check consistency
-                            sb.check();
-                            init_data_path(sb.uri());
-                            Ok(Meta { meta, sb })
-                        }
+                match sb {
+                    Err(e) => Err(e.to_string()),
+                    Ok(sb) => {
+                        // TODO: check consistency
+                        sb.check();
+                        init_data_path(sb.uri());
+                        Ok(Meta { meta, sb })
                     }
                 }
-            },
+            }
         }
     }
 
@@ -67,7 +69,7 @@ impl Meta {
         match self.meta.insert(key, value) {
             Ok(_) => {}
             Err(e) => {
-                log::info!("insert key {} fail, error {}", key, e.to_string())
+                log::info!("insert key {} fail, error {:?}", key, e)
             }
         }
     }
@@ -78,13 +80,11 @@ impl Meta {
                 log::error!("can't load key {} error {}", key, e);
                 None
             }
-            Ok(x) => x,
+            Ok(x) => Some(x),
         }
     }
 
-    pub fn close(&mut self) {
-        self.meta.flush();
-    }
+    pub fn close(&mut self) {}
 
     pub fn flush_sb(&self) -> Result<(), String> {
         match self.meta.insert(&SuperBlock::key(), &self.sb.val()) {
@@ -100,19 +100,14 @@ impl Meta {
     /// - load value of dentry key
     /// - if existed, load Inode from database
     /// - or else, return None
-    pub fn lookup(&mut self, parent: Ino, name: &String) -> Option<Inode> {
-        let parent = Dentry::key(parent, &name);
+    pub fn lookup(&mut self, parent: Ino, name: &str) -> Option<Inode> {
+        let parent = Dentry::key(parent, name);
         match self.meta.get(&parent) {
             Err(e) => {
                 log::error!("can't load dentry {}, error {}", parent, e.to_string());
                 None
             }
             Ok(dentry) => {
-                if dentry.is_none() {
-                    log::info!("can't find dentry {}", parent);
-                    return None;
-                }
-                let dentry = dentry.unwrap();
                 let dentry = bincode::deserialize::<Dentry>(&dentry).expect("can't deserialize dentry");
                 self.load_inode(dentry.ino)
             }
@@ -174,8 +169,8 @@ impl Meta {
         }
     }
 
-    pub fn unlink(&mut self, parent: Ino, name: &String) -> Result<Inode, libc::c_int> {
-        let key = self.lookup(parent, &name);
+    pub fn unlink(&mut self, parent: Ino, name: &str) -> Result<Inode, libc::c_int> {
+        let key = self.lookup(parent, name);
 
         if key.is_none() {
             return Err(ENOENT);
@@ -202,20 +197,15 @@ impl Meta {
         match self.meta.get(&key) {
             Err(e) => {
                 log::error!("load inode error {}", e.to_string());
-                return None;
+                None
             }
             Ok(tmp) => {
-                if tmp.is_none() {
-                    log::error!("can't find inode {}", key);
-                    None
-                } else {
-                    let inode = bincode::deserialize::<Inode>(&tmp.unwrap());
-                    if inode.is_err() {
-                        log::error!("deserialize inode fail error {}", inode.err().unwrap().to_string());
-                        return None;
-                    }
-                    Some(inode.unwrap())
+                let inode = bincode::deserialize::<Inode>(&tmp);
+                if inode.is_err() {
+                    log::error!("deserialize inode fail error {}", inode.err().unwrap().to_string());
+                    return None;
                 }
+                Some(inode.unwrap())
             }
         }
     }
@@ -232,7 +222,7 @@ impl Meta {
 
     pub fn load_dentry(&self, ino: Ino, handle: &Rc<RefCell<DirHandle>>) {
         let key = Dentry::prefix(ino);
-        let mut iter = self.meta.scan_prefix(&key);
+        let iter = self.meta.scan_prefix(&key);
 
         handle.borrow_mut().add(NameT {
             name: ".".to_string(),
@@ -243,8 +233,8 @@ impl Meta {
             kind: Itype::Dir,
         });
 
-        while let Some(i) = iter.next() {
-            let de = bincode::deserialize::<Dentry>(&i).expect("can't deserialize dentry");
+        for (_k, v) in iter {
+            let de = bincode::deserialize::<Dentry>(v).expect("can't deserialize dentry");
             let inode = self.load_inode(de.ino).expect("can't load inode");
             handle.borrow_mut().add(NameT {
                 name: de.name,
@@ -254,6 +244,7 @@ impl Meta {
     }
 
     pub fn dentry_exist(&self, ino: Ino, name: impl AsRef<str>) -> bool {
+        println!("===>> {:?}", name.as_ref());
         let name = Dentry::key(ino, name.as_ref());
         self.meta.contains_key(&name).expect("can't find key")
     }
@@ -279,8 +270,8 @@ impl Meta {
         let r = self.meta.remove(key);
         match r {
             Err(e) => {
-                log::error!("can't remove {} error {}", key, e);
-                Err(e.to_string())
+                log::error!("can't remove {} error {:?}", key, e);
+                Err(format!("{:?}", e))
             }
             Ok(_) => Ok(()),
         }

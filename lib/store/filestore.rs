@@ -15,14 +15,14 @@ static mut G_LUSHER: FileFlusher = FileFlusher;
 impl Flusher<String, std::fs::File> for FileFlusher {
     fn flush(&mut self, key: String, data: std::fs::File) {
         let mut file = data;
-        file.flush().expect(&format!("can't flush file {}", key));
+        file.flush().unwrap_or_else(|_| panic!("can't flush file {}", key));
         drop(file);
     }
 }
 
 static mut G_FILE_CACHE: Lazy<LRUCache<String, std::fs::File>> = Lazy::new(|| {
     let mut c = LRUCache::new(MAX_CACHE_ITEMS);
-    let p = unsafe { std::ptr::addr_of_mut!(G_LUSHER) };
+    let p = std::ptr::addr_of_mut!(G_LUSHER);
     c.set_backend(p);
     c
 });
@@ -80,7 +80,7 @@ impl FileStore {
         if let Some(tmp) = cache_get_mut(&key) {
             Some(tmp)
         } else {
-            let _ = std::fs::create_dir_all(&Self::build_dir(ino));
+            let _ = std::fs::create_dir_all(Self::build_dir(ino));
             let fpath = Self::build_path(ino, blk);
             // NOTE: do NOT use append, see `File::write_at` doc `pwrite64` bug
             let f = std::fs::File::options()
@@ -113,7 +113,7 @@ impl FileStore {
                 return false;
             }
         }
-        return true;
+        true
     }
 
     fn read_impl(&mut self, ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {

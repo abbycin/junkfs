@@ -34,7 +34,7 @@ pub fn init_data_path(mp: &str) {
 }
 
 pub fn get_data_path() -> &'static String {
-    unsafe { &*DATA_PATH }
+    unsafe { &DATA_PATH }
 }
 
 pub fn to_systime(s: u64) -> SystemTime {

@@ -92,7 +92,7 @@ impl CacheStore {
                 return nbytes;
             }
             unsafe {
-                ptr = ptr.add(i as usize);
+                ptr = ptr.add(i);
                 assert!(ptr < end);
             }
             assert!(sz <= FS_PAGE_SIZE as usize);
@@ -108,7 +108,7 @@ impl CacheStore {
             log::info!("flush cache");
             self.flush(meta);
         }
-        return MemPool::get().alloc();
+        MemPool::get().alloc()
     }
 
     // NOTE: the entry's order is mattered in bufs, do NOT reorder them
