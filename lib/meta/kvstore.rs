@@ -18,9 +18,7 @@ impl Flusher<String, Vec<u8>> for MaceStore {
 
 impl MaceStore {
     pub fn new(meta_path: &str, cache_cap: usize) -> Self {
-        let mut opt = Options::new(meta_path);
-        // FIXME: support large value
-        opt.page_size = 256 << 10;
+        let opt = Options::new(meta_path).validate().unwrap();
 
         Self {
             cache: RefCell::new(LRUCache::new(cache_cap)),
@@ -49,14 +47,16 @@ impl MaceStore {
             return Ok(v.clone());
         }
         let view = self.db.view()?;
-        match view.get(key) {
+        let x = view.get(key);
+        match x {
             Err(e) => {
                 log::error!("get {} fail, error {:?}", key, e);
                 Err(e)
             }
             Ok(o) => {
-                self.cache.borrow_mut().add(key.to_string(), o.data().to_vec());
-                Ok(o.data().to_vec())
+                let v = o.to_vec();
+                self.cache.borrow_mut().add(key.to_string(), v.clone());
+                Ok(v)
             }
         }
     }
@@ -69,7 +69,8 @@ impl MaceStore {
     pub fn remove(&self, key: &str) -> Result<(), OpCode> {
         self.cache.borrow_mut().del(&key.to_string());
         let kv = self.db.begin()?;
-        match kv.del(key) {
+        let x = kv.del(key);
+        match x {
             Err(e) => {
                 log::error!("remove {} fail, error {:?}", key, e);
                 Err(e)
@@ -83,7 +84,8 @@ impl MaceStore {
             return Ok(true);
         }
         let view = self.db.view()?;
-        match view.get(key) {
+        let x = view.get(key);
+        match x {
             Err(OpCode::NotFound) => Ok(false),
             Err(e) => {
                 log::error!("contains_key {} fail, error {:?}", key, e);

@@ -25,8 +25,7 @@ pub struct Meta {
 impl Meta {
     // write superblock
     pub fn format(meta_path: &str, store_path: &str) -> Result<(), String> {
-        let mut opt = Options::new(meta_path);
-        opt.page_size = 256 << 10;
+        let opt = Options::new(meta_path).validate().unwrap();
         let db = Mace::new(opt);
         if db.is_err() {
             return Err(format!("{:?}", db.err()));
