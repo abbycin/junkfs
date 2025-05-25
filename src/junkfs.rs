@@ -5,7 +5,7 @@ use tokio::signal::unix::{signal, SignalKind};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let level = std::env::var("JUNK_LEVEL").unwrap_or("WARN".to_string());
+    let level = std::env::var("JUNK_LEVEL").unwrap_or("INFO".to_string());
     let log_path = "/tmp/junkfs.log";
     Logger::init().add_file(log_path, true);
     log::set_max_level(log::LevelFilter::from_str(&level).unwrap());
@@ -14,9 +14,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    println!("log write to {} level {}", log_path, level);
     let meta_path = std::env::args().nth(1).unwrap();
     let mount_point = std::env::args().nth(2).unwrap();
+    println!(
+        "log write to {} level {} meta_path {:?} mount_point {:?}",
+        log_path, level, meta_path, mount_point
+    );
 
     let junkfs = Fs::new(meta_path);
     match junkfs {

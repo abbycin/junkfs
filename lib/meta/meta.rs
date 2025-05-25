@@ -243,7 +243,6 @@ impl Meta {
     }
 
     pub fn dentry_exist(&self, ino: Ino, name: impl AsRef<str>) -> bool {
-        println!("===>> {:?}", name.as_ref());
         let name = Dentry::key(ino, name.as_ref());
         self.meta.contains_key(&name).expect("can't find key")
     }
