@@ -18,11 +18,15 @@ impl Flusher<String, Vec<u8>> for MaceStore {
 
 impl MaceStore {
     pub fn new(meta_path: &str, cache_cap: usize) -> Self {
-        let opt = Options::new(meta_path).validate().unwrap();
+        let mut opt = Options::new(meta_path);
+        opt.wal_file_size = 16 << 20;
+        opt.gc_eager = true;
+        opt.gc_ratio = 10;
+        opt.gc_timeout = 10000; // 10s
 
         Self {
             cache: RefCell::new(LRUCache::new(cache_cap)),
-            db: Mace::new(opt).unwrap(),
+            db: Mace::new(opt.validate().unwrap()).unwrap(),
         }
     }
 
@@ -69,7 +73,8 @@ impl MaceStore {
     pub fn remove(&self, key: &str) -> Result<(), OpCode> {
         self.cache.borrow_mut().del(&key.to_string());
         let kv = self.db.begin()?;
-        let x = kv.del(key);
+        kv.del(key)?;
+        let x = kv.commit();
         match x {
             Err(e) => {
                 log::error!("remove {} fail, error {:?}", key, e);

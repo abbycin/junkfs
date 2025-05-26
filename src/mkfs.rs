@@ -13,6 +13,8 @@ fn main() {
         store_path.remove(store_path.len() - 1);
     }
 
+    let _ = std::fs::remove_dir_all(&meta_path);
+    let _ = std::fs::remove_dir_all(&store_path);
     let r = Meta::format(&meta_path, &store_path);
 
     match r {

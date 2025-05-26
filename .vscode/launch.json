@@ -1,0 +1,50 @@
+{
+        // Use IntelliSense to learn about possible attributes.
+        // Hover to view descriptions of existing attributes.
+        // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+        "version": "0.2.0",
+        "configurations": [
+                {
+                        "type": "lldb",
+                        "request": "launch",
+                        "name": "Debug executable 'junkfs'",
+                        "cargo": {
+                                "args": [
+                                        "build",
+                                        "--bin=junkfs",
+                                        "--package=junkfs"
+                                ],
+                                "filter": {
+                                        "name": "junkfs",
+                                        "kind": "bin"
+                                }
+                        },
+                        "args": [
+                                "/tmp/meta",
+                                "/home/abby/jfs"
+                        ],
+                        "cwd": "${workspaceFolder}"
+                },
+                {
+                        "type": "lldb",
+                        "request": "launch",
+                        "name": "Debug executable 'mkfs'",
+                        "cargo": {
+                                "args": [
+                                        "build",
+                                        "--bin=mkfs",
+                                        "--package=junkfs"
+                                ],
+                                "filter": {
+                                        "name": "mkfs",
+                                        "kind": "bin"
+                                }
+                        },
+                        "args": [
+                                "/tmp/meta",
+                                "/tmp/store"
+                        ],
+                        "cwd": "${workspaceFolder}"
+                }
+        ]
+}
