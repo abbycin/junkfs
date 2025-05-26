@@ -19,9 +19,10 @@ impl Flusher<String, Vec<u8>> for MaceStore {
 impl MaceStore {
     pub fn new(meta_path: &str, cache_cap: usize) -> Self {
         let mut opt = Options::new(meta_path);
+        opt.wal_file_size = 16 << 20;
         opt.gc_eager = true;
         opt.gc_ratio = 10;
-        opt.gc_timeout = 3000;
+        opt.gc_timeout = 10000; // 10s
 
         Self {
             cache: RefCell::new(LRUCache::new(cache_cap)),

@@ -103,7 +103,7 @@ impl Meta {
         let parent = Dentry::key(parent, name);
         match self.meta.get(&parent) {
             Err(e) => {
-                log::error!("can't load dentry {}, error {}", parent, e.to_string());
+                log::error!("can't load dentry {}, error {}", parent, e);
                 None
             }
             Ok(dentry) => {
@@ -195,13 +195,13 @@ impl Meta {
         let key = Inode::key(inode);
         match self.meta.get(&key) {
             Err(e) => {
-                log::error!("load inode error {}", e.to_string());
+                log::error!("load inode error {}", e);
                 None
             }
             Ok(tmp) => {
                 let inode = bincode::deserialize::<Inode>(&tmp);
                 if inode.is_err() {
-                    log::error!("deserialize inode fail error {}", inode.err().unwrap().to_string());
+                    log::error!("deserialize inode fail error {}", inode.err().unwrap());
                     return None;
                 }
                 Some(inode.unwrap())
@@ -251,7 +251,7 @@ impl Meta {
     pub fn store_dentry(&mut self, parent: Ino, name: impl AsRef<str>, ino: Ino) -> Result<(), String> {
         let key = Dentry::key(parent, name.as_ref());
         if self.meta.contains_key(&key).is_err() {
-            log::error!("dentry existed {}", key);
+            // log::error!("dentry existed {}", key);
             return Err(format!("key {key} exists"));
         }
         log::info!("store_dentry {}", key);
