@@ -1,5 +1,5 @@
 use crate::cache::{Flusher, LRUCache};
-use mace::{Mace, OpCode, Options, SeekIter};
+use mace::{Iter, Mace, OpCode, Options};
 use std::cell::RefCell;
 
 pub struct MaceStore {
@@ -65,7 +65,7 @@ impl MaceStore {
         }
     }
 
-    pub fn scan_prefix(&self, prefix: &str) -> SeekIter {
+    pub fn scan_prefix(&'_ self, prefix: &str) -> Iter<'_> {
         let view = self.db.view().unwrap();
         view.seek(prefix)
     }

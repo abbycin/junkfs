@@ -18,7 +18,7 @@ name = "junkfs"
 path = "lib/lib.rs"
 
 [dependencies]
-mace = { git = "https://github.com/abbycin/mace.git", branch = "master" }
+mace = { git = "https://github.com/abbycin/mace.git", branch = "junkfs" }
 bincode = "1.3.3"
 chrono = "0.4.38"
 fuser = "0.14.0"
