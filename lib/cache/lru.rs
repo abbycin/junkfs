@@ -63,7 +63,7 @@ where
         Self {
             head: p,
             map: HashMap::new(),
-            backend: unsafe { std::ptr::addr_of_mut!(G_DUMMY) },
+            backend: std::ptr::addr_of_mut!(G_DUMMY),
             cap,
             size: 0,
         }
@@ -75,23 +75,20 @@ where
     }
 
     pub fn add(&mut self, key: K, val: V) -> Option<&mut V> {
-        let r;
-        let e = self.map.get(&key);
-        if e.is_none() {
+        let r = if let Some(e) = self.map.get(&key) {
+            unsafe {
+                (*(*e)).set_val(val);
+            }
+            self.move_back(*e);
+            unsafe { (*(*e)).val.as_mut() }
+        } else {
             let node = Box::new(Node::new(key.clone(), val));
             let p = Box::into_raw(node);
             self.map.insert(key, p);
             self.push_back(p);
             self.size += 1;
-            r = unsafe { (*p).val.as_mut() }
-        } else {
-            let e = e.unwrap();
-            unsafe {
-                (*(*e)).set_val(val);
-            }
-            self.move_back(*e);
-            r = unsafe { (*(*e)).val.as_mut() }
-        }
+            unsafe { (*p).val.as_mut() }
+        };
 
         if self.size > self.cap {
             let node = self.front();

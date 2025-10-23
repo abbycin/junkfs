@@ -27,10 +27,12 @@ static mut G_FILE_CACHE: Lazy<LRUCache<String, std::fs::File>> = Lazy::new(|| {
     c
 });
 
+#[allow(static_mut_refs)]
 fn cache_add<'a>(key: String, val: std::fs::File) -> Option<&'a mut std::fs::File> {
     unsafe { G_FILE_CACHE.add(key, val) }
 }
 
+#[allow(static_mut_refs)]
 fn cache_get_mut<'a>(key: &String) -> Option<&'a mut std::fs::File> {
     unsafe { G_FILE_CACHE.get_mut(key) }
 }
@@ -84,9 +86,10 @@ impl FileStore {
             let fpath = Self::build_path(ino, blk);
             // NOTE: do NOT use append, see `File::write_at` doc `pwrite64` bug
             let f = std::fs::File::options()
-                .create(true)
                 .read(true)
                 .write(true)
+                .truncate(false)
+                .create(true)
                 .open(&fpath);
             if f.is_err() {
                 log::error!("can't create {}", fpath);
@@ -147,7 +150,7 @@ impl FileStore {
 }
 
 impl Store for FileStore {
-    fn write(&mut self, meta: &mut Meta, ino: Ino, buf: &Vec<Entry>) {
+    fn write(&mut self, meta: &mut Meta, ino: Ino, buf: &[Entry]) {
         if buf.is_empty() {
             return;
         }

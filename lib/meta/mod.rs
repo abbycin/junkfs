@@ -1,13 +1,13 @@
 mod dentry;
 mod inode;
 mod kvstore;
-mod meta;
+mod meta_data;
 mod super_block;
 
-use crate::meta::meta::NameT;
+use crate::meta::meta_data::NameT;
 use crate::store::CacheStore;
 pub use inode::{Inode, Itype};
-pub use meta::{Ino, Meta};
+pub use meta_data::{Ino, Meta};
 
 pub trait MetaKV {
     fn key(&self) -> String;
@@ -79,7 +79,7 @@ impl DirHandle {
         true
     }
 
-    pub fn next(&mut self) -> Option<&NameT> {
+    pub fn get_next(&mut self) -> Option<&NameT> {
         if self.pos == self.entry.len() {
             None
         } else {

@@ -27,6 +27,7 @@ impl MemPool {
         }
     }
 
+    #[allow(static_mut_refs)]
     pub fn get() -> &'static mut MemPool {
         unsafe { G_MEMPOOL.as_mut() }
     }

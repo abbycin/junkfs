@@ -15,7 +15,7 @@ struct Entry {
 }
 
 trait Store {
-    fn write(&mut self, meta: &mut Meta, ino: Ino, buf: &Vec<Entry>);
+    fn write(&mut self, meta: &mut Meta, ino: Ino, buf: &[Entry]);
 
     fn read(&mut self, ino: Ino, off: u64, size: usize) -> Option<Vec<u8>>;
 }

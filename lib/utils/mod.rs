@@ -33,6 +33,7 @@ pub fn init_data_path(mp: &str) {
     }
 }
 
+#[allow(static_mut_refs)]
 pub fn get_data_path() -> &'static String {
     unsafe { &DATA_PATH }
 }

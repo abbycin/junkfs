@@ -225,14 +225,14 @@ impl Filesystem for Fs {
                 reply.error(EEXIST);
             }
             Some(mut inode) => {
-                if mode.is_some() {
-                    inode.mode = mode.unwrap() as u16;
+                if let Some(x) = mode {
+                    inode.mode = x as u16;
                 }
-                if uid.is_some() {
-                    inode.uid = uid.unwrap();
+                if let Some(x) = uid {
+                    inode.uid = x;
                 }
-                if gid.is_some() {
-                    inode.gid = gid.unwrap();
+                if let Some(x) = gid {
+                    inode.gid = x;
                 }
                 // FIXME: how to handle `size` change, truncate ???
                 match self.meta.store_inode(&inode) {
@@ -388,7 +388,7 @@ impl Filesystem for Fs {
         log::info!("readdir ino {} fh {} offset {}", ino, fh, offset);
         if let Some(h) = self.find_dir_handle(ino, fh) {
             let mut off = h.borrow().off() as i64;
-            while let Some(i) = h.borrow_mut().next() {
+            while let Some(i) = h.borrow_mut().get_next() {
                 if reply.add(ino, off, to_filetype(i.kind), &i.name) {
                     log::info!("add dentry buffer full, current entry {} offset {}", i.name, off);
                     break;

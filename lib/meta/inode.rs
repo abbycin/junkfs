@@ -25,7 +25,7 @@ pub struct Inode {
 
 impl Inode {
     pub fn blocks(&self) -> u64 {
-        self.length / FS_BLK_SIZE + (if self.length % FS_BLK_SIZE > 0 { 1 } else { 0 })
+        self.length / FS_BLK_SIZE + (if !self.length.is_multiple_of(FS_BLK_SIZE) { 1 } else { 0 })
     }
 
     pub fn key(ino: Ino) -> String {

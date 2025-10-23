@@ -48,6 +48,10 @@ impl BitMap {
         self.count
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     pub fn cap(&self) -> u64 {
         self.size
     }
