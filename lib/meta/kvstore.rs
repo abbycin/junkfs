@@ -23,7 +23,7 @@ impl MaceStore {
         opt.wal_file_size = 16 << 20;
         opt.max_log_size = 24 << 20;
         opt.gc_eager = true;
-        opt.gc_ratio = 10;
+        opt.data_garbage_ratio = 10;
         opt.gc_timeout = 10000; // 10s
 
         Self {
