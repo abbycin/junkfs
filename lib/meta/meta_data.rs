@@ -233,8 +233,8 @@ impl Meta {
             kind: Itype::Dir,
         });
 
-        for (_k, v) in iter {
-            let de = bincode::deserialize::<Dentry>(v).expect("can't deserialize dentry");
+        for item in iter {
+            let de = bincode::deserialize::<Dentry>(item.val()).expect("can't deserialize dentry");
             let inode = self.load_inode(de.ino).expect("can't load inode");
             handle.borrow_mut().add(NameT {
                 name: de.name,

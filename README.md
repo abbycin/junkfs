@@ -1,4 +1,4 @@
-## A toy filesystem based on FUSE
+## A toy filesystem based on FUSE (It has now become a testing tool for [Mace](https://github.com/abbycin/mace))
 
 supported operations:
 
@@ -82,9 +82,3 @@ umount, also notify `junkfs` to quit
 ```bash
 $ umount ~/jfs
 ```
-
-## TODO
-
-- [ ] `du` support
-- [ ] `file lock` and concurrency support
-- [ ] remote `MetaData` and `File` storage
