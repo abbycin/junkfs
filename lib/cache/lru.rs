@@ -105,6 +105,7 @@ where
         r
     }
 
+    #[allow(unused)]
     pub fn get(&mut self, key: &K) -> Option<&V> {
         if !self.map.contains_key(key) {
             return None;
@@ -124,6 +125,7 @@ where
         unsafe { (*(*tmp)).val.as_mut() }
     }
 
+    #[allow(unused)]
     pub fn del(&mut self, key: &K) {
         if let Some(node) = self.map.remove(key) {
             self.remove_node(node);

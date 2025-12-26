@@ -94,7 +94,7 @@ mod test {
         let path = "/tmp/test_sb";
         let _ = std::fs::remove_dir_all(path);
         let _ = std::fs::create_dir_all(path);
-        let db = MaceStore::new(path, 1024);
+        let db = MaceStore::new(path);
 
         let x = db.insert("sb", &tmp);
         println!("{:?}, tmp.len {:?}", x, tmp.len());

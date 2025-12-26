@@ -3,7 +3,7 @@ use crate::meta::inode::{Inode, Itype};
 use crate::meta::kvstore::MaceStore;
 use crate::meta::super_block::SuperBlock;
 use crate::meta::{DirHandle, MetaKV};
-use crate::utils::{init_data_path, FS_META_CACHE_SIZE};
+use crate::utils::init_data_path;
 use libc::{EEXIST, EFAULT, ENOENT, ENOTEMPTY};
 use mace::{Mace, OpCode, Options};
 use std::cell::RefCell;
@@ -44,7 +44,7 @@ impl Meta {
     }
 
     pub fn load_fs(path: String) -> Result<Self, String> {
-        let meta = MaceStore::new(&path, FS_META_CACHE_SIZE);
+        let meta = MaceStore::new(&path);
         let sb = meta.get(&SuperBlock::key());
         match sb {
             Err(OpCode::NotFound) => Err("not formated".to_string()),

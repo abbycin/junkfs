@@ -1,10 +1,7 @@
-use crate::cache::{Flusher, LRUCache};
+use crate::cache::Flusher;
 use mace::{Iter, Mace, OpCode, Options};
-use std::cell::RefCell;
 
 pub struct MaceStore {
-    /// read cache
-    cache: RefCell<LRUCache<String, Vec<u8>>>,
     db: Mace,
 }
 
@@ -17,7 +14,7 @@ impl Flusher<String, Vec<u8>> for MaceStore {
 }
 
 impl MaceStore {
-    pub fn new(meta_path: &str, cache_cap: usize) -> Self {
+    pub fn new(meta_path: &str) -> Self {
         let mut opt = Options::new(meta_path);
         opt.workers = 4; // we will lookup while iterating prefix, so 1 worker is not enough
         opt.wal_file_size = 16 << 20;
@@ -27,7 +24,6 @@ impl MaceStore {
         opt.gc_timeout = 10000; // 10s
 
         Self {
-            cache: RefCell::new(LRUCache::new(cache_cap)),
             db: Mace::new(opt.validate().unwrap()).unwrap(),
         }
     }
@@ -41,17 +37,11 @@ impl MaceStore {
                 log::error!("insert {} fail, error {:?}", key, e);
                 Err(e)
             }
-            Ok(_) => {
-                self.cache.borrow_mut().add(key.to_string(), val.to_vec());
-                Ok(())
-            }
+            Ok(_) => Ok(()),
         }
     }
 
     pub fn get(&self, key: &str) -> Result<Vec<u8>, OpCode> {
-        if let Some(v) = self.cache.borrow_mut().get(&key.to_string()) {
-            return Ok(v.clone());
-        }
         let view = self.db.view()?;
         let x = view.get(key);
         match x {
@@ -59,11 +49,7 @@ impl MaceStore {
                 log::error!("get {} fail, error {:?}", key, e);
                 Err(e)
             }
-            Ok(o) => {
-                let v = o.to_vec();
-                self.cache.borrow_mut().add(key.to_string(), v.clone());
-                Ok(v)
-            }
+            Ok(o) => Ok(o.to_vec()),
         }
     }
 
@@ -73,7 +59,6 @@ impl MaceStore {
     }
 
     pub fn remove(&self, key: &str) -> Result<(), OpCode> {
-        self.cache.borrow_mut().del(&key.to_string());
         let kv = self.db.begin()?;
         kv.del(key)?;
         let x = kv.commit();
@@ -87,9 +72,6 @@ impl MaceStore {
     }
 
     pub fn contains_key(&self, key: &str) -> Result<bool, OpCode> {
-        if self.cache.borrow_mut().get(&key.to_string()).is_some() {
-            return Ok(true);
-        }
         let view = self.db.view()?;
         let x = view.get(key);
         match x {
@@ -100,11 +82,5 @@ impl MaceStore {
             }
             Ok(_) => Ok(true),
         }
-    }
-}
-
-impl Drop for MaceStore {
-    fn drop(&mut self) {
-        self.cache.borrow_mut().flush();
     }
 }
