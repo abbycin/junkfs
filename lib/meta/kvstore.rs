@@ -1,5 +1,5 @@
 use crate::cache::Flusher;
-use mace::{Iter, Mace, OpCode, Options};
+use mace::{Mace, OpCode, Options, TxnView};
 
 pub struct MaceStore {
     db: Mace,
@@ -16,7 +16,7 @@ impl Flusher<String, Vec<u8>> for MaceStore {
 impl MaceStore {
     pub fn new(meta_path: &str) -> Self {
         let mut opt = Options::new(meta_path);
-        opt.workers = 4; // we will lookup while iterating prefix, so 1 worker is not enough
+        opt.concurrent_write = 1;
         opt.wal_file_size = 16 << 20;
         opt.max_log_size = 24 << 20;
         opt.gc_eager = true;
@@ -53,9 +53,8 @@ impl MaceStore {
         }
     }
 
-    pub fn scan_prefix(&'_ self, prefix: &str) -> Iter<'_> {
-        let view = self.db.view().unwrap();
-        view.seek(prefix)
+    pub fn view(&self) -> TxnView<'_> {
+        self.db.view().unwrap()
     }
 
     pub fn remove(&self, key: &str) -> Result<(), OpCode> {

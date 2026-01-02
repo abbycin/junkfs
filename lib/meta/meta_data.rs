@@ -26,7 +26,7 @@ impl Meta {
     // write superblock
     pub fn format(meta_path: &str, store_path: &str) -> Result<(), String> {
         let mut opt = Options::new(meta_path);
-        opt.workers = 1;
+        opt.concurrent_write = 1;
         let db = Mace::new(opt.validate().unwrap());
         if db.is_err() {
             return Err(format!("{:?}", db.err()));
@@ -178,7 +178,8 @@ impl Meta {
         let inode = key.unwrap();
         if inode.kind == Itype::Dir {
             let prefix = Dentry::prefix(inode.id);
-            let mut it = self.meta.scan_prefix(&prefix);
+            let view = self.meta.view();
+            let mut it = view.seek(&prefix);
             if it.next().is_some() {
                 return Err(ENOTEMPTY);
             }
@@ -222,7 +223,8 @@ impl Meta {
 
     pub fn load_dentry(&self, ino: Ino, handle: &Rc<RefCell<DirHandle>>) {
         let key = Dentry::prefix(ino);
-        let iter = self.meta.scan_prefix(&key);
+        let view = self.meta.view();
+        let iter = view.seek(&key);
 
         handle.borrow_mut().add(NameT {
             name: ".".to_string(),
