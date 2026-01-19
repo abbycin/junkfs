@@ -2,7 +2,7 @@
 
 ### 元数据设计
 
-在`junkfs`中，元数据序列化后存在`kvdb`中（使用`sled`实现），因此在格式化时需要提供 `kvdb`的存储路径，同时`junkfs`
+在`junkfs`中，元数据序列化后存在`kvdb`中（~~使用`sled`实现~~ 使用 `mace` 实现），因此在格式化时需要提供 `kvdb`的存储路径，同时`junkfs`
 旨在做本地的文件系统，因此，在格式化时还需要将数据存储路径写入到元数据中
 
 在`junkfs`中，元数据分为
@@ -71,8 +71,8 @@ pub enum Itype {
 
 #### 文件抽象
 
-在`junkfs`中也有类似于内核中的`struct file`结构，这个结构就是`FileHandle`，它包含一个全局位于的`id`
-，在文件时分配，关闭时释放，一个文件可以打开多次，因此存在一个`inode`对应多个`FileHandle`的情况
+在`junkfs`中也有类似于内核中的`struct file`结构，这个结构就是`FileHandle`，它包含一个全局唯一的`id`
+，在文件打开时分配，关闭时释放，一个文件可以打开多次，因此存在一个`inode`对应多个`FileHandle`的情况
 
 在`FileHandle`中实现了`read`、`write`和`flush`功能，这样是对照`struct file`设计的，`Inode`负责结构管理，`FileHandle`负责内容管理
 
@@ -89,18 +89,22 @@ pub enum Itype {
 
 ##### 元数据缓存
 
-元数据缓存包括`dentry`和`inode`采用`LRU`淘汰算法，设计上是支持`write back`的，但在实现上确实`write through`，对于`ls`
-这种极度常用的命令，如果采用`write back`模式，每次都需要从`kvdb`读取`dentry`后再和缓存对比去重取新，实现稍显复杂，因此元数据缓存仅作为读缓存使用
+~~元数据缓存包括`dentry`和`inode`采用`LRU`淘汰算法，设计上是支持`write back`的，但在实现上确实`write through`，对于`ls`
+这种极度常用的命令，如果采用`write back`模式，每次都需要从`kvdb`读取`dentry`后再和缓存对比去重取新，实现稍显复杂，因此元数据缓存仅作为读缓存使用~~
+
+已删除，使用数据库自带的缓存即可
 
 ##### 数据缓存
 
 数据缓存使用固定大小的页面组成，在设计上，当缓存不足时将缓存刷到文件中，或在刷写超时后刷到文件。同样在实现中每当文件关闭时或读取前都会将缓存刷到文件中，原因是`junkfs`
 没有定时任务支持，同时对于同一个文件描述符写后读场景有限，结果就是数据缓存显得很鸡肋。如果后续后续有了定时任务支持，那么就可以实现写数据到缓存后立即返回，提高写性能。在`Rust`
 中实现还是有点困难，尤其是`fuser`这个`crate`本身不支持`async`这一套（[这里](https://github.com/jmpq/async-fuse-rs)
-倒是有个异步实现），如果使用额外线程来实现，那数据和代码结构将会非常复杂。
+倒是有个异步实现），如果使用额外线程来实现，那数据和代码结构将会非常复杂
 
 ### 元数据引擎
 
-在`junkfs`中，目前仅使用了`sled`作为元数据存储引擎，但在实现时考虑了扩展性，其他的引擎只需要实现`MetaStore`
+~~在`junkfs`中，目前仅使用了`sled`作为元数据存储引擎，但在实现时考虑了扩展性，其他的引擎只需要实现`MetaStore`
 trait即可替换掉`sled`，存储引擎只需要提供`key-value`接口即可，比如存储引擎为关系式数据库，那么对于`ls`
-命令，可能的操作是 `select * from dentry_table where dentry_name like 'd_233_%'`
+命令，可能的操作是 `select * from dentry_table where dentry_name like 'd_233_%'`~~
+
+目前已经改为使用 `mace` 作为元数据引擎，并且不考虑扩展

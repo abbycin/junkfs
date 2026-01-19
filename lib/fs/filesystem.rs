@@ -534,6 +534,13 @@ impl Filesystem for Fs {
 
 impl Drop for Fs {
     fn drop(&mut self) {
+        log::info!("dropping junkfs, flushing all handles");
+        for (ino, handles) in self.store.borrow_mut().iter() {
+            for h in handles {
+                log::info!("flushing ino {} on drop", ino);
+                h.borrow_mut().flush(&mut self.meta);
+            }
+        }
         self.meta.close();
         MemPool::destroy();
     }

@@ -50,6 +50,9 @@ pub struct LRUCache<K: Eq + Hash + Clone, V> {
     size: usize,
 }
 
+unsafe impl<K: Eq + Hash + Clone + Send, V: Send> Send for LRUCache<K, V> {}
+unsafe impl<K: Eq + Hash + Clone + Sync, V: Sync> Sync for LRUCache<K, V> {}
+
 impl<K, V> LRUCache<K, V>
 where
     K: Eq + Hash + Clone,
@@ -195,7 +198,8 @@ where
     K: Eq + Hash + Clone,
 {
     fn drop(&mut self) {
-        let mut nodes = 1 + self.size; // including dummy head
+        self.flush();
+        let mut nodes = 1; // including dummy head
         unsafe {
             let mut p = (*self.head).next;
             (*self.head).next = std::ptr::null_mut();

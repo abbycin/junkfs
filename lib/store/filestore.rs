@@ -4,8 +4,8 @@ use crate::store::{Entry, Store};
 use crate::utils::{get_data_path, FS_BLK_SIZE, FS_FUSE_MAX_IO_SIZE};
 use once_cell::sync::Lazy;
 use std::cmp::{max, min};
-use std::io::Write;
 use std::os::unix::prelude::FileExt;
+use std::sync::Mutex;
 const MAX_CACHE_ITEMS: usize = 256;
 
 struct FileFlusher;
@@ -14,28 +14,18 @@ static mut G_LUSHER: FileFlusher = FileFlusher;
 
 impl Flusher<String, std::fs::File> for FileFlusher {
     fn flush(&mut self, key: String, data: std::fs::File) {
-        let mut file = data;
-        file.flush().unwrap_or_else(|_| panic!("can't flush file {}", key));
+        let file = data;
+        file.sync_all().unwrap_or_else(|_| panic!("can't sync file {}", key));
         drop(file);
     }
 }
 
-static mut G_FILE_CACHE: Lazy<LRUCache<String, std::fs::File>> = Lazy::new(|| {
+static G_FILE_CACHE: Lazy<Mutex<LRUCache<String, std::fs::File>>> = Lazy::new(|| {
     let mut c = LRUCache::new(MAX_CACHE_ITEMS);
     let p = std::ptr::addr_of_mut!(G_LUSHER);
     c.set_backend(p);
-    c
+    Mutex::new(c)
 });
-
-#[allow(static_mut_refs)]
-fn cache_add<'a>(key: String, val: std::fs::File) -> Option<&'a mut std::fs::File> {
-    unsafe { G_FILE_CACHE.add(key, val) }
-}
-
-#[allow(static_mut_refs)]
-fn cache_get_mut<'a>(key: &String) -> Option<&'a mut std::fs::File> {
-    unsafe { G_FILE_CACHE.get_mut(key) }
-}
 
 pub struct FileStore;
 
@@ -75,77 +65,76 @@ impl FileStore {
         }
     }
 
-    fn get_fp<'a, 'b>(key: String, ino: Ino, blk: u64) -> Option<&'b mut std::fs::File>
+    fn get_fp_and_then<F, R>(key: String, ino: Ino, blk: u64, f: F) -> Option<R>
     where
-        'a: 'b,
+        F: FnOnce(&mut std::fs::File) -> R,
     {
-        if let Some(tmp) = cache_get_mut(&key) {
-            Some(tmp)
+        let mut cache = G_FILE_CACHE.lock().unwrap();
+        if let Some(fp) = cache.get_mut(&key) {
+            Some(f(fp))
         } else {
             let _ = std::fs::create_dir_all(Self::build_dir(ino));
             let fpath = Self::build_path(ino, blk);
-            // NOTE: do NOT use append, see `File::write_at` doc `pwrite64` bug
-            let f = std::fs::File::options()
+            let fp = std::fs::File::options()
                 .read(true)
                 .write(true)
                 .truncate(false)
                 .create(true)
                 .open(&fpath);
-            if f.is_err() {
+            if let Ok(fp) = fp {
+                let fp_ref = cache.add(key, fp).unwrap();
+                Some(f(fp_ref))
+            } else {
                 log::error!("can't create {}", fpath);
-                return None;
+                None
             }
-            cache_add(key, f.unwrap())
         }
     }
+
     fn write_impl(&mut self, ino: Ino, e: &Entry) -> bool {
         let key = Self::write_key(ino, e.blk_id);
-        let fp = Self::get_fp(key, ino, e.blk_id);
-
-        if fp.is_none() {
-            log::error!("can't open file {}_{}", ino, e.blk_id);
-            return false;
-        }
-
-        let fp = fp.unwrap();
-        unsafe {
+        Self::get_fp_and_then(key, ino, e.blk_id, |fp| unsafe {
             let s = std::slice::from_raw_parts(e.data, e.size as usize);
             let r = fp.write_at(s, e.blk_off);
-            if r.is_err() {
-                log::error!("can't write entry {:?}", e);
-                return false;
+            if let Err(err) = r {
+                log::error!("can't write entry {:?} error {}", e, err);
+                false
+            } else {
+                true
             }
-        }
-        true
+        })
+        .unwrap_or(false)
     }
 
     fn read_impl(&mut self, ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {
         let blk_id = off / FS_BLK_SIZE;
         let key = Self::read_key(ino, blk_id);
-        let fp = Self::get_fp(key, ino, blk_id);
-        if fp.is_none() {
-            log::error!("can't open file for read {}_{}", ino, blk_id);
-            return None;
-        }
-        let fp = fp.unwrap();
+
         let mut sz = min(FS_FUSE_MAX_IO_SIZE, size as u64);
-        // check off + sz is cross chunk, if so, read at most rest bytes in current block
         if (off + sz) / FS_BLK_SIZE == (blk_id + 1) {
             sz = (blk_id + 1) * FS_BLK_SIZE - off;
         }
-        let mut v = vec![0u8; sz as usize];
-        let buf = v.as_mut_slice();
-        let r = fp.read_at(buf, off % FS_BLK_SIZE);
-        if r.is_err() {
-            log::error!(
-                "can't read data blk_id {} off {} size {}",
-                blk_id,
-                off % FS_BLK_SIZE,
-                sz
-            );
-            return None;
-        }
-        Some(v)
+
+        Self::get_fp_and_then(key, ino, blk_id, |fp| {
+            let mut v = vec![0u8; sz as usize];
+            match fp.read_at(&mut v, off % FS_BLK_SIZE) {
+                Ok(n) => {
+                    v.truncate(n);
+                    Some(v)
+                }
+                Err(e) => {
+                    log::error!(
+                        "can't read data blk_id {} off {} size {} error {}",
+                        blk_id,
+                        off % FS_BLK_SIZE,
+                        sz,
+                        e
+                    );
+                    None
+                }
+            }
+        })
+        .flatten()
     }
 }
 
@@ -155,20 +144,25 @@ impl Store for FileStore {
             return;
         }
         let mut sz = 0;
-        let mut inode = meta.load_inode(ino).unwrap();
+        let mut inode = meta.load_inode(ino).expect("can't load inode");
+
+        let mut affected_blks = std::collections::HashSet::new();
 
         for e in buf {
             sz = max(sz, e.off + e.size);
-            log::info!(
-                "write off {} size {} inode.length {} size {}",
-                e.off,
-                e.size,
-                inode.length,
-                sz
-            );
             if !self.write_impl(ino, e) {
                 log::warn!("write {}_{} fail", ino, e.blk_id);
                 return;
+            }
+            affected_blks.insert(e.blk_id);
+        }
+
+        // ensure data is on disk before updating metadata
+        for blk_id in affected_blks {
+            let key = Self::write_key(ino, blk_id);
+            let res = Self::get_fp_and_then(key, ino, blk_id, |fp| fp.sync_all().map_err(|e| e.to_string()));
+            if let Some(Err(e)) = res {
+                log::error!("can't sync file {}_{} error {}", ino, blk_id, e);
             }
         }
 
