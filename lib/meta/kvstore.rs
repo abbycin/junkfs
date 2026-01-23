@@ -7,7 +7,7 @@ pub struct MaceStore {
 
 impl Flusher<String, Vec<u8>> for MaceStore {
     fn flush(&mut self, key: String, data: Vec<u8>) {
-        let kv = self.db.begin().unwrap();
+        let kv = self.db.begin().expect("can't fail");
         kv.upsert(&key, &data).unwrap();
         kv.commit().unwrap();
     }
@@ -54,7 +54,7 @@ impl MaceStore {
     }
 
     pub fn view(&self) -> TxnView<'_> {
-        self.db.view().unwrap()
+        self.db.view().expect("can't fail")
     }
 
     pub fn remove(&self, key: &str) -> Result<(), OpCode> {

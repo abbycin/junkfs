@@ -6,7 +6,6 @@ use crate::meta::{DirHandle, MetaKV};
 use crate::utils::init_data_path;
 use libc::{EEXIST, EFAULT, ENOENT, ENOTEMPTY};
 use mace::{Mace, OpCode, Options};
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type Ino = u64;
@@ -34,17 +33,14 @@ impl Meta {
 
         let db = db.unwrap();
         let mut sb = SuperBlock::new(store_path);
-        
-        let kv = db.begin().unwrap();
-        
+
+        let kv = db.begin().expect("can't fail");
+
         // alloc root inode id (1)
         let root_ino = sb.alloc_ino().expect("can't alloc root ino");
         assert_eq!(root_ino, 1);
 
-        let epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
         let root_inode = Inode {
             id: root_ino,
@@ -62,7 +58,7 @@ impl Meta {
 
         kv.put(SuperBlock::key(), sb.val()).unwrap();
         kv.put(Inode::key(root_ino), Inode::val(&root_inode)).unwrap();
-        
+
         kv.commit().map_err(|e| e.to_string())
     }
 
@@ -335,12 +331,7 @@ impl Meta {
         Ok(())
     }
 
-    pub fn link(
-        &mut self,
-        ino: Ino,
-        new_parent: Ino,
-        new_name: &str,
-    ) -> Result<Inode, libc::c_int> {
+    pub fn link(&mut self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode, libc::c_int> {
         let mut inode = self.load_inode(ino).ok_or(ENOENT)?;
         if inode.kind == Itype::Dir {
             return Err(libc::EPERM); // hard links to directories are not allowed

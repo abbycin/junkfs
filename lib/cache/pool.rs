@@ -1,7 +1,7 @@
 use crate::utils::{align_up, BitMap, FS_PAGE_SIZE};
-use std::mem::ManuallyDrop;
-use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
+use std::mem::ManuallyDrop;
+use std::sync::Mutex;
 
 pub struct MemPool {
     ptr: *mut u8,

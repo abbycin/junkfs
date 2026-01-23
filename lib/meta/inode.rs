@@ -1,5 +1,4 @@
 use super::{Ino, MetaKV};
-use crate::utils::FS_BLK_SIZE;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
@@ -27,7 +26,7 @@ pub struct Inode {
 impl Inode {
     pub fn blocks(&self) -> u64 {
         // block count in 512 bytes unit
-        (self.length + 511) / 512
+        self.length.div_ceil(512)
     }
 
     pub fn key(ino: Ino) -> String {

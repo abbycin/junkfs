@@ -1,12 +1,12 @@
 use crate::cache::MemPool;
 use crate::meta::{DirHandle, FileHandle, Ino, Itype, Meta};
 use crate::store::FileStore;
-use crate::utils::{to_attr, to_filetype, BitMap, FS_BLK_SIZE, FS_FUSE_MAX_IO_SIZE};
+use crate::utils::{to_attr, to_filetype, BitMap, FS_BLK_SIZE};
 use fuser::{
     Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
     Request, TimeOrNow,
 };
-use libc::{E2BIG, EEXIST, EFAULT, ENOENT, ENOSYS, ENOTDIR, S_IFMT, S_IFREG};
+use libc::{EFAULT, ENOENT};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -148,10 +148,16 @@ impl Filesystem for Fs {
         match meta.load_inode(ino) {
             None => reply.error(ENOENT),
             Some(mut inode) => {
-                if let Some(x) = mode { inode.mode = x as u16; }
-                if let Some(x) = uid { inode.uid = x; }
-                if let Some(x) = gid { inode.gid = x; }
-                if let Some(x) = _size { 
+                if let Some(x) = mode {
+                    inode.mode = x as u16;
+                }
+                if let Some(x) = uid {
+                    inode.uid = x;
+                }
+                if let Some(x) = gid {
+                    inode.gid = x;
+                }
+                if let Some(x) = _size {
                     if x < inode.length {
                         let f_handles = self.file_handles.lock().unwrap();
                         for h in f_handles.values() {
@@ -161,14 +167,20 @@ impl Filesystem for Fs {
                             }
                         }
                     }
-                    inode.length = x; 
+                    inode.length = x;
                 }
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 if let Some(x) = _atime {
-                    inode.atime = match x { TimeOrNow::Now => now, TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs() };
+                    inode.atime = match x {
+                        TimeOrNow::Now => now,
+                        TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    };
                 }
                 if let Some(x) = _mtime {
-                    inode.mtime = match x { TimeOrNow::Now => now, TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs() };
+                    inode.mtime = match x {
+                        TimeOrNow::Now => now,
+                        TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    };
                 }
                 meta.store_inode(&inode).unwrap();
                 let attr = to_attr(&inode);
@@ -186,7 +198,17 @@ impl Filesystem for Fs {
         }
     }
 
-    fn read(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+    fn read(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyData,
+    ) {
         let mut meta = self.meta.lock().unwrap();
         if let Some(h) = self.find_file_handle(fh) {
             let mut f = h.lock().unwrap();
@@ -200,7 +222,18 @@ impl Filesystem for Fs {
         }
     }
 
-    fn write(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
         let mut meta = self.meta.lock().unwrap();
         if let Some(h) = self.find_file_handle(fh) {
             let mut f = h.lock().unwrap();
@@ -231,7 +264,16 @@ impl Filesystem for Fs {
         }
     }
 
-    fn release(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) {
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
         let mut meta = self.meta.lock().unwrap();
         self.remove_file_handle(fh, &mut meta);
         reply.ok();
@@ -271,10 +313,25 @@ impl Filesystem for Fs {
         reply.ok();
     }
 
-    fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
         let name_str = name.to_string_lossy();
-        log::info!("create parent {} name {} flags {} mask {}", parent, name_str, _flags, _umask);
-        
+        log::info!(
+            "create parent {} name {} flags {} mask {}",
+            parent,
+            name_str,
+            _flags,
+            _umask
+        );
+
         let mut meta = self.meta.lock().unwrap();
         match meta.mknod(parent, &name_str, Itype::File, mode) {
             Err(e) => {
@@ -284,7 +341,7 @@ impl Filesystem for Fs {
             Ok(inode) => {
                 let ino = inode.id;
                 let attr = to_attr(&inode);
-                drop(meta); 
+                drop(meta);
                 if let Some(handle) = self.new_file_handle(ino) {
                     let fh = handle.lock().unwrap().fh;
                     reply.created(&time::Duration::new(1, 0), &attr, 0, fh, 0);
@@ -295,9 +352,18 @@ impl Filesystem for Fs {
         }
     }
 
-    fn mknod(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, _rdev: u32, reply: ReplyEntry) {
+    fn mknod(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
         let mut meta = self.meta.lock().unwrap();
-        match meta.mknod(parent, &name.to_string_lossy(), Itype::File, mode) {
+        match meta.mknod(parent, name.to_string_lossy(), Itype::File, mode) {
             Ok(inode) => reply.entry(&time::Duration::new(1, 0), &to_attr(&inode), 0),
             Err(e) => reply.error(e),
         }
@@ -305,7 +371,7 @@ impl Filesystem for Fs {
 
     fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
         let mut meta = self.meta.lock().unwrap();
-        match meta.mknod(parent, &name.to_string_lossy(), Itype::Dir, mode) {
+        match meta.mknod(parent, name.to_string_lossy(), Itype::Dir, mode) {
             Ok(inode) => reply.entry(&time::Duration::new(1, 0), &to_attr(&inode), 0),
             Err(e) => reply.error(e),
         }
@@ -339,14 +405,14 @@ impl Filesystem for Fs {
     fn symlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, link: &Path, reply: ReplyEntry) {
         let mut meta = self.meta.lock().unwrap();
         let target = link.to_string_lossy().to_string();
-        match meta.mknod(parent, &name.to_string_lossy(), Itype::Symlink, 0o777) {
+        match meta.mknod(parent, name.to_string_lossy(), Itype::Symlink, 0o777) {
             Ok(inode) => {
                 let ino = inode.id;
                 let attr = to_attr(&inode);
-                drop(meta); 
+                drop(meta);
                 if let Some(h) = self.new_file_handle(ino) {
                     let mut f = h.lock().unwrap();
-                    let mut meta = self.meta.lock().unwrap(); 
+                    let mut meta = self.meta.lock().unwrap();
                     f.write(&mut meta, 0, target.as_bytes());
                     f.flush(&mut meta);
                 }
@@ -357,13 +423,13 @@ impl Filesystem for Fs {
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        let mut meta = self.meta.lock().unwrap();
+        let meta = self.meta.lock().unwrap();
         if let Some(inode) = meta.load_inode(ino) {
             let len = inode.length as usize;
-            drop(meta); 
+            drop(meta);
             if let Some(h) = self.new_file_handle(ino) {
                 let mut f = h.lock().unwrap();
-                let mut meta = self.meta.lock().unwrap(); 
+                let mut meta = self.meta.lock().unwrap();
                 if let Some(data) = f.read(&mut meta, 0, len) {
                     reply.data(&data);
                     return;
@@ -384,7 +450,16 @@ impl Filesystem for Fs {
         }
     }
 
-    fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
         let mut meta = self.meta.lock().unwrap();
         match meta.rename(parent, &name.to_string_lossy(), newparent, &newname.to_string_lossy()) {
             Ok(_) => reply.ok(),
