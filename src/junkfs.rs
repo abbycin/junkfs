@@ -1,7 +1,6 @@
 use junkfs::fs::Fs;
 use junkfs::logger::Logger;
 use std::str::FromStr;
-use tokio::signal::unix::{signal, SignalKind};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,17 +27,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
         Ok(junkfs) => {
-            let options = [
+            let options = vec![
                 fuser::MountOption::FSName("jfs".to_string()),
                 fuser::MountOption::Subtype("jfs".to_string()),
+                // fuser::MountOption::AutoUnmount,
             ];
-            let session = fuser::spawn_mount2(junkfs, &mount_point, &options).expect("can't mount");
-            let mut sig_int = signal(SignalKind::interrupt())?;
-            let mut sig_term = signal(SignalKind::terminate())?;
-
-            tokio::select! {
-                _ = sig_int.recv() => session.join(),
-                _ = sig_term.recv() => session.join(),
+            println!("Starting FUSE mount at {:?}...", mount_point);
+            if let Err(e) = fuser::mount2(junkfs, &mount_point, &options) {
+                log::error!("FUSE mount failed: {:?}", e);
+                eprintln!("FUSE mount failed: {:?}", e);
+                std::process::exit(1);
             }
         }
     }

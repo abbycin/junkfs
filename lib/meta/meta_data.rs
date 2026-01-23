@@ -6,8 +6,7 @@ use crate::meta::{DirHandle, MetaKV};
 use crate::utils::init_data_path;
 use libc::{EEXIST, EFAULT, ENOENT, ENOTEMPTY};
 use mace::{Mace, OpCode, Options};
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type Ino = u64;
@@ -15,6 +14,7 @@ pub type Ino = u64;
 pub struct NameT {
     pub name: String,
     pub kind: Itype,
+    pub ino: Ino,
 }
 
 pub struct Meta {
@@ -33,13 +33,36 @@ impl Meta {
         }
 
         let db = db.unwrap();
-        let sb = SuperBlock::new(store_path);
+        let mut sb = SuperBlock::new(store_path);
+        
         let kv = db.begin().unwrap();
-        let r = kv.put(SuperBlock::key(), sb.val());
+        
+        // alloc root inode id (1)
+        let root_ino = sb.alloc_ino().expect("can't alloc root ino");
+        assert_eq!(root_ino, 1);
 
-        if r.is_err() {
-            return Err(format!("{:?}", r.err()));
-        }
+        let epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let root_inode = Inode {
+            id: root_ino,
+            parent: 0, // root has no parent
+            kind: Itype::Dir,
+            mode: 0o755,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            atime: epoch,
+            mtime: epoch,
+            ctime: epoch,
+            length: 0,
+            links: 2, // . and ..
+        };
+
+        kv.put(SuperBlock::key(), sb.val()).unwrap();
+        kv.put(Inode::key(root_ino), Inode::val(&root_inode)).unwrap();
+        
         kv.commit().map_err(|e| e.to_string())
     }
 
@@ -125,14 +148,7 @@ impl Meta {
             .expect("can't get unix timestamp")
             .as_secs();
 
-        // NOTE: for superblock, we skip slot 0 in bitmap
-        if parent == 0 {
-            self.sb.alloc_ino().unwrap();
-        }
         if let Some(ino) = self.sb.alloc_ino() {
-            if parent == 0 {
-                assert_eq!(ino, 1);
-            }
             let inode = Inode {
                 id: ino,
                 parent,
@@ -221,42 +237,46 @@ impl Meta {
         Ok(())
     }
 
-    pub fn load_dentry(&self, ino: Ino, handle: &Rc<RefCell<DirHandle>>) {
+    pub fn load_dentry(&self, ino: Ino, h: &mut DirHandle) {
         let key = Dentry::prefix(ino);
         let view = self.meta.view();
         let iter = view.seek(&key);
 
-        handle.borrow_mut().add(NameT {
+        let self_inode = self.load_inode(ino).expect("can't load self inode");
+
+        h.add(NameT {
             name: ".".to_string(),
             kind: Itype::Dir,
+            ino,
         });
-        handle.borrow_mut().add(NameT {
+        h.add(NameT {
             name: "..".to_string(),
             kind: Itype::Dir,
+            ino: if ino == 1 { 1 } else { self_inode.parent },
         });
 
         for item in iter {
+            if !item.key().starts_with(key.as_bytes()) {
+                break;
+            }
             let de = bincode::deserialize::<Dentry>(item.val()).expect("can't deserialize dentry");
             let inode = self.load_inode(de.ino).expect("can't load inode");
-            handle.borrow_mut().add(NameT {
+            h.add(NameT {
                 name: de.name,
                 kind: inode.kind,
+                ino: de.ino,
             });
         }
     }
 
     pub fn dentry_exist(&self, ino: Ino, name: impl AsRef<str>) -> bool {
         let name = Dentry::key(ino, name.as_ref());
-        self.meta.contains_key(&name).expect("can't find key")
+        self.meta.contains_key(&name).unwrap_or(false)
     }
 
     /// if `key` exist, we can overwrite it
     pub fn store_dentry(&mut self, parent: Ino, name: impl AsRef<str>, ino: Ino) -> Result<(), String> {
         let key = Dentry::key(parent, name.as_ref());
-        if self.meta.contains_key(&key).is_err() {
-            // log::error!("dentry existed {}", key);
-            return Err(format!("key {key} exists"));
-        }
         log::info!("store_dentry {}", key);
         let de = Dentry::new(parent, ino, name.as_ref());
         let r = self.meta.insert(&key, &de.val());
@@ -276,5 +296,69 @@ impl Meta {
             }
             Ok(_) => Ok(()),
         }
+    }
+
+    pub fn rename(
+        &mut self,
+        old_parent: Ino,
+        old_name: &str,
+        new_parent: Ino,
+        new_name: &str,
+    ) -> Result<(), libc::c_int> {
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(());
+        }
+
+        let inode = self.lookup(old_parent, old_name).ok_or(ENOENT)?;
+
+        if let Some(old_target_inode) = self.lookup(new_parent, new_name) {
+            if old_target_inode.kind == Itype::Dir {
+                // check if empty
+                let prefix = Dentry::prefix(old_target_inode.id);
+                let view = self.meta.view();
+                let mut it = view.seek(&prefix);
+                if it.next().is_some() {
+                    return Err(ENOTEMPTY);
+                }
+            }
+            // unlink target dentry and dec nlink
+            self.unlink(new_parent, new_name)?;
+        }
+
+        // store new dentry
+        self.store_dentry(new_parent, new_name, inode.id).map_err(|_| EFAULT)?;
+
+        // remove old dentry
+        let dkey = Dentry::key(old_parent, old_name);
+        self.delete_key(&dkey).map_err(|_| EFAULT)?;
+
+        Ok(())
+    }
+
+    pub fn link(
+        &mut self,
+        ino: Ino,
+        new_parent: Ino,
+        new_name: &str,
+    ) -> Result<Inode, libc::c_int> {
+        let mut inode = self.load_inode(ino).ok_or(ENOENT)?;
+        if inode.kind == Itype::Dir {
+            return Err(libc::EPERM); // hard links to directories are not allowed
+        }
+
+        if self.dentry_exist(new_parent, new_name) {
+            return Err(EEXIST);
+        }
+
+        inode.links += 1;
+        inode.ctime = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("can't get unix timestamp")
+            .as_secs();
+
+        self.store_inode(&inode).map_err(|_| EFAULT)?;
+        self.store_dentry(new_parent, new_name, ino).map_err(|_| EFAULT)?;
+
+        Ok(inode)
     }
 }

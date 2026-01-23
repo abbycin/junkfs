@@ -166,15 +166,28 @@ impl Store for FileStore {
             }
         }
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        inode.mtime = now;
+        inode.ctime = now;
+
         // try update inode.length
         if inode.length < sz {
             log::info!("trying to update inode.length {} to {}", inode.length, sz);
             inode.length = sz;
-            meta.store_inode(&inode).unwrap()
         }
+        meta.store_inode(&inode).unwrap()
     }
 
-    fn read(&mut self, ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {
+    fn read(&mut self, meta: &mut Meta, ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {
+        let inode = meta.load_inode(ino).expect("can't load inode");
+        if off >= inode.length {
+            return Some(Vec::new());
+        }
+        let size = min(size as u64, inode.length - off) as usize;
         self.read_impl(ino, off, size)
     }
 }
+

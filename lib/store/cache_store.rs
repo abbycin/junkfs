@@ -9,7 +9,7 @@ const CACHE_LIMIT: usize = 32; // 128K
 pub struct CacheStore {
     ino: Ino,
     bufs: Vec<Entry>,
-    store: Box<dyn Store>,
+    store: Box<dyn Store + Send>,
 }
 
 impl CacheStore {
@@ -61,7 +61,14 @@ impl CacheStore {
 
     pub fn read(&mut self, meta: &mut Meta, off: u64, size: usize) -> Option<Vec<u8>> {
         self.flush(meta);
-        self.store.read(self.ino, off, size)
+        self.store.read(meta, self.ino, off, size)
+    }
+
+    pub fn clear(&mut self) {
+        for i in &self.bufs {
+            MemPool::free_block(i.data);
+        }
+        self.bufs.clear();
     }
 
     fn copy_data(&mut self, src: *const u8, dst: *mut u8, size: usize, blk_id: u64, blk_off: u64, off: u64) {
@@ -96,7 +103,7 @@ impl CacheStore {
                 assert!(ptr < end);
             }
             assert!(sz <= FS_PAGE_SIZE as usize);
-            self.copy_data(ptr, mem, sz, blk_id, blk_off + i as u64, off);
+            self.copy_data(ptr, mem, sz, blk_id, blk_off + i as u64, off + i as u64);
             i += sz;
             nbytes += sz;
         }
@@ -104,18 +111,18 @@ impl CacheStore {
     }
 
     fn alloc(&mut self, meta: &mut Meta) -> *mut u8 {
-        if self.bufs.len() >= CACHE_LIMIT || MemPool::get().full() {
+        if self.bufs.len() >= CACHE_LIMIT || MemPool::is_full() {
             log::info!("flush cache");
             self.flush(meta);
         }
-        MemPool::get().alloc()
+        MemPool::alloc_block()
     }
 
     // NOTE: the entry's order is mattered in bufs, do NOT reorder them
     pub fn flush(&mut self, meta: &mut Meta) {
         self.store.write(meta, self.ino, &self.bufs);
         for i in &self.bufs {
-            MemPool::get().free(i.data);
+            MemPool::free_block(i.data);
         }
         self.bufs.clear();
     }

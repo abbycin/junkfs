@@ -16,7 +16,7 @@ pub trait MetaKV {
 }
 
 pub struct FileHandle {
-    ino: Ino,
+    pub ino: Ino,
     pub fh: u64,
     cache: CacheStore,
 }
@@ -26,7 +26,7 @@ impl FileHandle {
         Self {
             ino,
             fh,
-            cache: CacheStore::new(ino), // TODO: we can pass config here to change store backend
+            cache: CacheStore::new(ino),
         }
     }
 
@@ -36,6 +36,10 @@ impl FileHandle {
 
     pub fn flush(&mut self, meta: &mut Meta) {
         self.cache.flush(meta);
+    }
+
+    pub fn clear(&mut self) {
+        self.cache.clear();
     }
 
     pub fn read(&mut self, meta: &mut Meta, off: u64, size: usize) -> Option<Vec<u8>> {
@@ -68,6 +72,10 @@ impl DirHandle {
         self.entry.push(e);
     }
 
+    pub fn seek(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
     pub fn off(&self) -> usize {
         self.pos
     }
@@ -88,26 +96,15 @@ impl DirHandle {
             Some(tmp)
         }
     }
+
+    pub fn get_at(&self, pos: usize) -> Option<&NameT> {
+        self.entry.get(pos)
+    }
 }
+
 
 impl Drop for DirHandle {
     fn drop(&mut self) {
         log::info!("drop DirHandle fh {} entry size {}", self.fh, self.entry.len());
-    }
-}
-
-pub trait HandleCmp {
-    fn eq(&self, fh: u64) -> bool;
-}
-
-impl HandleCmp for FileHandle {
-    fn eq(&self, fh: u64) -> bool {
-        self.fh == fh
-    }
-}
-
-impl HandleCmp for DirHandle {
-    fn eq(&self, fh: u64) -> bool {
-        self.fh == fh
     }
 }

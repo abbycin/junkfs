@@ -1,8 +1,7 @@
 use crate::utils::{align_up, BitMap, FS_PAGE_SIZE};
 use std::mem::ManuallyDrop;
-use std::ptr::NonNull;
-
-static mut G_MEMPOOL: NonNull<MemPool> = NonNull::dangling();
+use std::sync::{Arc, Mutex};
+use once_cell::sync::Lazy;
 
 pub struct MemPool {
     ptr: *mut u8,
@@ -10,26 +9,45 @@ pub struct MemPool {
     dmap: BitMap,
 }
 
+unsafe impl Send for MemPool {}
+unsafe impl Sync for MemPool {}
+
+static G_MEMPOOL: Lazy<Mutex<Option<MemPool>>> = Lazy::new(|| Mutex::new(None));
+
 impl MemPool {
     pub fn init(cap: u64) {
-        unsafe {
-            let obj = Box::new(MemPool::new(cap));
-            let ptr = Box::into_raw(obj);
-            G_MEMPOOL = NonNull::new(ptr).expect("can't create nonnull");
-        }
+        let mut pool = G_MEMPOOL.lock().unwrap();
+        *pool = Some(MemPool::new(cap));
     }
 
-    // unnecessary for long-running program
     pub fn destroy() {
-        unsafe {
-            let ptr = G_MEMPOOL.as_ptr();
-            let _ = Box::from_raw(ptr);
+        let mut pool = G_MEMPOOL.lock().unwrap();
+        *pool = None;
+    }
+
+    pub fn alloc_block() -> *mut u8 {
+        let mut pool = G_MEMPOOL.lock().unwrap();
+        if let Some(ref mut p) = *pool {
+            p.alloc()
+        } else {
+            std::ptr::null_mut()
         }
     }
 
-    #[allow(static_mut_refs)]
-    pub fn get() -> &'static mut MemPool {
-        unsafe { G_MEMPOOL.as_mut() }
+    pub fn free_block(ptr: *mut u8) {
+        let mut pool = G_MEMPOOL.lock().unwrap();
+        if let Some(ref mut p) = *pool {
+            p.free(ptr);
+        }
+    }
+
+    pub fn is_full() -> bool {
+        let pool = G_MEMPOOL.lock().unwrap();
+        if let Some(ref p) = *pool {
+            p.full()
+        } else {
+            true
+        }
     }
 
     fn new(cap: u64) -> Self {
@@ -98,16 +116,20 @@ mod test {
     fn test_singleton() {
         MemPool::init(FS_PAGE_SIZE * 3);
 
-        let x = MemPool::get().alloc();
-        let y = MemPool::get().alloc();
-        let z = MemPool::get().alloc();
+        let x = MemPool::alloc_block();
+        let y = MemPool::alloc_block();
+        let z = MemPool::alloc_block();
 
         unsafe {
             let sz = FS_PAGE_SIZE as isize;
             assert_eq!(y.offset_from(x), sz);
             assert_eq!(z.offset_from(y), sz);
         }
-        assert!(MemPool::get().full());
+        assert!(MemPool::is_full());
+
+        MemPool::free_block(x);
+        MemPool::free_block(y);
+        MemPool::free_block(z);
 
         MemPool::destroy();
     }

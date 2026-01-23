@@ -14,10 +14,13 @@ pub struct SuperBlock {
 
 impl SuperBlock {
     pub fn new(uri: &str) -> Self {
+        let mut imap = BitMap::new(FS_TOTAL_INODES);
+        // reserve ino 0
+        imap.add(0);
         SuperBlock {
             ino: FS_ROOT_INODE,
             uri: uri.to_string(),
-            imap: BitMap::new(FS_TOTAL_INODES),
+            imap,
         }
     }
 

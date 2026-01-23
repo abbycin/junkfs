@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CHUNK_SIZE: u64 = 1 << 26;
 pub const BLOCK_SIZE: u64 = 1 << 22;
-pub const FS_BLK_SIZE: u64 = 128 << 20;
+pub const FS_BLK_SIZE: u64 = 128 << 10;
 pub const FS_FUSE_MAX_IO_SIZE: u64 = 128u64 << 10;
 pub const FS_TOTAL_INODES: u64 = 1 << 20;
 
@@ -45,6 +45,7 @@ pub fn to_filetype(s: Itype) -> FileType {
     match s {
         Itype::File => FileType::RegularFile,
         Itype::Dir => FileType::Directory,
+        Itype::Symlink => FileType::Symlink,
     }
 }
 
@@ -57,7 +58,7 @@ pub fn to_attr(inode: &Inode) -> FileAttr {
         mtime: to_systime(inode.mtime),
         ctime: to_systime(inode.ctime),
         kind: to_filetype(inode.kind),
-        perm: inode.mode,
+        perm: (inode.mode & 0o7777),
         nlink: inode.links,
         uid: inode.uid,
         gid: inode.gid,

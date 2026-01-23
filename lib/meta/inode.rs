@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum Itype {
     File,
     Dir,
+    Symlink,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -25,7 +26,8 @@ pub struct Inode {
 
 impl Inode {
     pub fn blocks(&self) -> u64 {
-        self.length / FS_BLK_SIZE + (if !self.length.is_multiple_of(FS_BLK_SIZE) { 1 } else { 0 })
+        // block count in 512 bytes unit
+        (self.length + 511) / 512
     }
 
     pub fn key(ino: Ino) -> String {
