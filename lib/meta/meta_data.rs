@@ -26,15 +26,11 @@ impl Meta {
     pub fn format(meta_path: &str, store_path: &str) -> Result<(), String> {
         let mut opt = Options::new(meta_path);
         opt.concurrent_write = 1;
-        let db = Mace::new(opt.validate().unwrap());
-        if db.is_err() {
-            return Err(format!("{:?}", db.err()));
-        }
-
-        let db = db.unwrap();
+        let db = Mace::new(opt.validate().unwrap()).map_err(|e| format!("{:?}", e))?;
+        let bucket = MaceStore::open_bucket(&db).map_err(|e| format!("{:?}", e))?;
         let mut sb = SuperBlock::new(store_path);
 
-        let kv = db.begin().expect("can't fail");
+        let kv = bucket.begin().expect("can't fail");
 
         // alloc root inode id (1)
         let root_ino = sb.alloc_ino().expect("can't alloc root ino");
@@ -105,6 +101,10 @@ impl Meta {
 
     pub fn close(&mut self) {}
 
+    pub fn sync(&self) -> Result<(), String> {
+        self.meta.sync().map_err(|e| e.to_string())
+    }
+
     pub fn flush_sb(&self) -> Result<(), String> {
         match self.meta.insert(&SuperBlock::key(), &self.sb.val()) {
             Err(e) => {
@@ -144,50 +144,39 @@ impl Meta {
             .expect("can't get unix timestamp")
             .as_secs();
 
-        if let Some(ino) = self.sb.alloc_ino() {
-            let inode = Inode {
-                id: ino,
-                parent,
-                kind: ftype,
-                mode: mode as u16,
-                uid: unsafe { libc::getuid() },
-                gid: unsafe { libc::getgid() },
-                atime: epoch,
-                mtime: epoch,
-                ctime: epoch,
-                length: 0,
-                links: 1,
-            };
+        let mut sb = self.sb.clone();
+        let ino = sb.alloc_ino().ok_or(ENOENT)?;
 
-            let r = self.store_inode(&inode);
-            if r.is_err() {
-                log::error!("can't store inode {}", ino);
-                self.sb.free_ino(ino);
-                return Err(EFAULT);
-            }
+        let inode = Inode {
+            id: ino,
+            parent,
+            kind: ftype,
+            mode: mode as u16,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            atime: epoch,
+            mtime: epoch,
+            ctime: epoch,
+            length: 0,
+            links: 1,
+        };
 
-            let r = self.store_dentry(parent, &name, ino);
-            if r.is_err() {
-                self.sb.free_ino(ino);
-                let key = Inode::key(ino);
-                self.delete_key(&key).expect("can't remove key");
-                return Err(EFAULT);
-            }
+        let dkey = Dentry::key(parent, name.as_ref());
+        let de = Dentry::new(parent, ino, name.as_ref());
 
-            let _ = self.flush_sb();
-            Ok(inode)
-        } else {
-            Err(ENOENT)
-        }
+        let kv = self.meta.begin().map_err(|_| EFAULT)?;
+        kv.upsert(SuperBlock::key(), sb.val()).map_err(|_| EFAULT)?;
+        kv.put(Inode::key(ino), inode.val()).map_err(|_| EFAULT)?;
+        kv.put(dkey, de.val()).map_err(|_| EFAULT)?;
+        kv.commit().map_err(|_| EFAULT)?;
+
+        self.sb = sb;
+        Ok(inode)
     }
 
     pub fn unlink(&mut self, parent: Ino, name: &str) -> Result<Inode, libc::c_int> {
-        let key = self.lookup(parent, name);
+        let mut inode = self.lookup(parent, name).ok_or(ENOENT)?;
 
-        if key.is_none() {
-            return Err(ENOENT);
-        }
-        let inode = key.unwrap();
         if inode.kind == Itype::Dir {
             let prefix = Dentry::prefix(inode.id);
             let view = self.meta.view();
@@ -196,12 +185,32 @@ impl Meta {
                 return Err(ENOTEMPTY);
             }
         }
-        let ikey = Inode::key(inode.id);
+
         let dkey = Dentry::key(parent, name);
-        self.delete_key(&ikey).unwrap();
-        self.delete_key(&dkey).unwrap();
-        self.sb.free_ino(inode.id);
-        let _ = self.flush_sb();
+        let kv = self.meta.begin().map_err(|_| EFAULT)?;
+
+        if inode.kind != Itype::Dir && inode.links > 1 {
+            inode.links -= 1;
+            inode.ctime = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("can't get unix timestamp")
+                .as_secs();
+            kv.upsert(Inode::key(inode.id), inode.val()).map_err(|_| EFAULT)?;
+            kv.del(dkey).map_err(|_| EFAULT)?;
+            kv.commit().map_err(|_| EFAULT)?;
+            return Ok(inode);
+        }
+
+        let mut sb = self.sb.clone();
+        sb.free_ino(inode.id);
+
+        kv.del(Inode::key(inode.id)).map_err(|_| EFAULT)?;
+        kv.del(dkey).map_err(|_| EFAULT)?;
+        kv.upsert(SuperBlock::key(), sb.val()).map_err(|_| EFAULT)?;
+        kv.commit().map_err(|_| EFAULT)?;
+
+        self.sb = sb;
+        inode.links = 0;
         Ok(inode)
     }
 
@@ -321,13 +330,27 @@ impl Meta {
             self.unlink(new_parent, new_name)?;
         }
 
-        // store new dentry
-        self.store_dentry(new_parent, new_name, inode.id).map_err(|_| EFAULT)?;
-
-        // remove old dentry
         let dkey = Dentry::key(old_parent, old_name);
-        self.delete_key(&dkey).map_err(|_| EFAULT)?;
+        let new_dkey = Dentry::key(new_parent, new_name);
+        let new_de = Dentry::new(new_parent, inode.id, new_name);
 
+        let kv = self.meta.begin().map_err(|_| EFAULT)?;
+        // store new dentry
+        kv.put(new_dkey, new_de.val()).map_err(|_| EFAULT)?;
+        // remove old dentry
+        kv.del(dkey).map_err(|_| EFAULT)?;
+
+        if inode.kind == Itype::Dir && old_parent != new_parent {
+            let mut inode = inode;
+            inode.parent = new_parent;
+            inode.ctime = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("can't get unix timestamp")
+                .as_secs();
+            kv.upsert(Inode::key(inode.id), inode.val()).map_err(|_| EFAULT)?;
+        }
+
+        kv.commit().map_err(|_| EFAULT)?;
         Ok(())
     }
 
@@ -347,8 +370,12 @@ impl Meta {
             .expect("can't get unix timestamp")
             .as_secs();
 
-        self.store_inode(&inode).map_err(|_| EFAULT)?;
-        self.store_dentry(new_parent, new_name, ino).map_err(|_| EFAULT)?;
+        let dkey = Dentry::key(new_parent, new_name);
+        let de = Dentry::new(new_parent, ino, new_name);
+        let kv = self.meta.begin().map_err(|_| EFAULT)?;
+        kv.upsert(Inode::key(ino), inode.val()).map_err(|_| EFAULT)?;
+        kv.put(dkey, de.val()).map_err(|_| EFAULT)?;
+        kv.commit().map_err(|_| EFAULT)?;
 
         Ok(inode)
     }

@@ -1,12 +1,16 @@
 use crate::cache::{Flusher, LRUCache};
 use crate::meta::{Ino, Meta};
 use crate::store::{Entry, Store};
-use crate::utils::{get_data_path, FS_BLK_SIZE, FS_FUSE_MAX_IO_SIZE};
+use crate::utils::{get_data_path, FS_FUSE_MAX_IO_SIZE};
 use once_cell::sync::Lazy;
 use std::cmp::{max, min};
+use std::io::ErrorKind;
 use std::os::unix::prelude::FileExt;
+use std::path::Path;
 use std::sync::Mutex;
 const MAX_CACHE_ITEMS: usize = 256;
+const DATA_SHARD_BITS: u64 = 8;
+const DATA_SHARD_MASK: u64 = (1 << DATA_SHARD_BITS) - 1;
 
 struct FileFlusher;
 
@@ -37,35 +41,132 @@ impl Flusher<u64, std::fs::File> for FileStore {
 }
 
 impl FileStore {
-    fn read_key(ino: Ino, blk: u64) -> String {
-        format!("{}r{}", ino, blk)
+    fn file_key(ino: Ino) -> String {
+        format!("i{}", ino)
     }
 
-    fn write_key(ino: Ino, blk: u64) -> String {
-        format!("{}w{}", ino, blk)
+    fn shard(ino: Ino) -> (u8, u8) {
+        let s1 = (ino & DATA_SHARD_MASK) as u8;
+        let s2 = ((ino >> DATA_SHARD_BITS) & DATA_SHARD_MASK) as u8;
+        (s1, s2)
     }
 
-    fn build_path(ino: Ino, blk: u64) -> String {
-        format!("{}/{}/{}", get_data_path(), ino, blk)
+    fn build_dir1(ino: Ino) -> String {
+        let (s1, _) = Self::shard(ino);
+        format!("{}/{:02x}", get_data_path(), s1)
     }
 
     fn build_dir(ino: Ino) -> String {
-        format!("{}/{}", get_data_path(), ino)
+        let (s1, s2) = Self::shard(ino);
+        format!("{}/{:02x}/{:02x}", get_data_path(), s1, s2)
     }
 
-    pub fn unlink(ino: Ino, blk_id: u64) {
-        let p = Self::build_path(ino, blk_id);
-        match std::fs::remove_file(&p) {
-            Err(e) => {
-                log::error!("can't remove {} error {}", p, e);
+    fn build_path(ino: Ino) -> String {
+        let (s1, s2) = Self::shard(ino);
+        format!("{}/{:02x}/{:02x}/{}", get_data_path(), s1, s2, ino)
+    }
+
+    fn fsync_dir(path: &str) {
+        match std::fs::File::open(path) {
+            Ok(dir) => {
+                if let Err(e) = dir.sync_all() {
+                    log::error!("can't sync dir {} error {}", path, e);
+                }
             }
-            Ok(_) => {
-                log::info!("remove file {}", p);
+            Err(e) => {
+                log::error!("can't open dir {} error {}", path, e);
             }
         }
     }
 
-    fn get_fp_and_then<F, R>(key: String, ino: Ino, blk: u64, f: F) -> Option<R>
+    fn ensure_root_dir() -> Result<(), String> {
+        let root = get_data_path().as_str();
+        if Path::new(root).exists() {
+            return Ok(());
+        }
+        if let Err(e) = std::fs::create_dir_all(root) {
+            log::error!("can't create data root {} error {}", root, e);
+            return Err(e.to_string());
+        }
+        if let Some(parent) = Path::new(root).parent().and_then(|p| p.to_str()) {
+            Self::fsync_dir(parent);
+        }
+        Self::fsync_dir(root);
+        Ok(())
+    }
+
+    fn ensure_dir(path: &str, parent: &str) -> Result<(), String> {
+        match std::fs::create_dir(path) {
+            Ok(_) => {
+                Self::fsync_dir(parent);
+                Self::fsync_dir(path);
+                Ok(())
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => {
+                log::error!("can't create dir {} error {}", path, e);
+                Err(e.to_string())
+            }
+        }
+    }
+
+    fn ensure_dirs(ino: Ino) -> Result<(), String> {
+        Self::ensure_root_dir()?;
+        let root = get_data_path().as_str();
+        let dir1 = Self::build_dir1(ino);
+        let dir2 = Self::build_dir(ino);
+        Self::ensure_dir(&dir1, root)?;
+        Self::ensure_dir(&dir2, &dir1)?;
+        Ok(())
+    }
+
+    fn open_for_read(ino: Ino) -> Option<std::fs::File> {
+        let fpath = Self::build_path(ino);
+        match std::fs::File::options().read(true).open(&fpath) {
+            Ok(fp) => Some(fp),
+            Err(e) => {
+                if e.kind() != ErrorKind::NotFound {
+                    log::error!("can't open {} error {}", fpath, e);
+                }
+                None
+            }
+        }
+    }
+
+    fn open_for_write(ino: Ino) -> Option<std::fs::File> {
+        if let Err(e) = Self::ensure_dirs(ino) {
+            log::error!("can't prepare data dir for ino {} error {}", ino, e);
+            return None;
+        }
+        let fpath = Self::build_path(ino);
+        let dir = Self::build_dir(ino);
+        match std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&fpath)
+        {
+            Ok(fp) => {
+                Self::fsync_dir(&dir);
+                Some(fp)
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                match std::fs::File::options().read(true).write(true).open(&fpath) {
+                    Ok(fp) => Some(fp),
+                    Err(e) => {
+                        log::error!("can't open {} error {}", fpath, e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("can't create {} error {}", fpath, e);
+                None
+            }
+        }
+    }
+
+    fn get_fp_and_then<F, R>(key: String, ino: Ino, create: bool, f: F) -> Option<R>
     where
         F: FnOnce(&mut std::fs::File) -> R,
     {
@@ -73,29 +174,80 @@ impl FileStore {
         if let Some(fp) = cache.get_mut(&key) {
             Some(f(fp))
         } else {
-            let _ = std::fs::create_dir_all(Self::build_dir(ino));
-            let fpath = Self::build_path(ino, blk);
-            let fp = std::fs::File::options()
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .create(true)
-                .open(&fpath);
-            if let Ok(fp) = fp {
-                let fp_ref = cache.add(key, fp).unwrap();
-                Some(f(fp_ref))
+            let fp = if create { Self::open_for_write(ino) } else { Self::open_for_read(ino) }?;
+            let fp_ref = cache.add(key, fp).unwrap();
+            Some(f(fp_ref))
+        }
+    }
+
+    fn sync_file(ino: Ino, datasync: bool) -> bool {
+        let key = Self::file_key(ino);
+        let res = Self::get_fp_and_then(key, ino, false, |fp| {
+            if datasync {
+                fp.sync_data().map_err(|e| e.to_string())
             } else {
-                log::error!("can't create {}", fpath);
-                None
+                fp.sync_all().map_err(|e| e.to_string())
+            }
+        });
+        match res {
+            Some(Ok(())) => true,
+            Some(Err(e)) => {
+                log::error!("can't sync file {} error {}", ino, e);
+                false
+            }
+            None => {
+                log::error!("can't sync file {}", ino);
+                false
+            }
+        }
+    }
+
+    pub fn set_len(ino: Ino, size: u64) -> Result<(), String> {
+        let key = Self::file_key(ino);
+        let res = Self::get_fp_and_then(key, ino, true, |fp| {
+            fp.set_len(size)?;
+            fp.sync_all()
+        });
+        match res {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(e.to_string()),
+            None => Err("can't open data file".to_string()),
+        }
+    }
+
+    pub fn fsync(ino: Ino, datasync: bool) -> Result<(), String> {
+        if Self::sync_file(ino, datasync) {
+            Ok(())
+        } else {
+            Err("can't sync file".to_string())
+        }
+    }
+
+    pub fn unlink(ino: Ino) {
+        let key = Self::file_key(ino);
+        if let Ok(mut cache) = G_FILE_CACHE.lock() {
+            cache.del(&key);
+        }
+        let p = Self::build_path(ino);
+        match std::fs::remove_file(&p) {
+            Err(e) => {
+                if e.kind() != ErrorKind::NotFound {
+                    log::error!("can't remove {} error {}", p, e);
+                }
+            }
+            Ok(_) => {
+                let dir = Self::build_dir(ino);
+                Self::fsync_dir(&dir);
+                log::info!("remove file {}", p);
             }
         }
     }
 
     fn write_impl(&mut self, ino: Ino, e: &Entry) -> bool {
-        let key = Self::write_key(ino, e.blk_id);
-        Self::get_fp_and_then(key, ino, e.blk_id, |fp| unsafe {
+        let key = Self::file_key(ino);
+        Self::get_fp_and_then(key, ino, true, |fp| unsafe {
             let s = std::slice::from_raw_parts(e.data, e.size as usize);
-            let r = fp.write_at(s, e.blk_off);
+            let r = fp.write_at(s, e.off);
             if let Err(err) = r {
                 log::error!("can't write entry {:?} error {}", e, err);
                 false
@@ -107,29 +259,18 @@ impl FileStore {
     }
 
     fn read_impl(&mut self, ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {
-        let blk_id = off / FS_BLK_SIZE;
-        let key = Self::read_key(ino, blk_id);
+        let key = Self::file_key(ino);
+        let sz = min(FS_FUSE_MAX_IO_SIZE, size as u64) as usize;
 
-        let mut sz = min(FS_FUSE_MAX_IO_SIZE, size as u64);
-        if (off + sz) / FS_BLK_SIZE == (blk_id + 1) {
-            sz = (blk_id + 1) * FS_BLK_SIZE - off;
-        }
-
-        Self::get_fp_and_then(key, ino, blk_id, |fp| {
-            let mut v = vec![0u8; sz as usize];
-            match fp.read_at(&mut v, off % FS_BLK_SIZE) {
+        Self::get_fp_and_then(key, ino, false, |fp| {
+            let mut v = vec![0u8; sz];
+            match fp.read_at(&mut v, off) {
                 Ok(n) => {
                     v.truncate(n);
                     Some(v)
                 }
                 Err(e) => {
-                    log::error!(
-                        "can't read data blk_id {} off {} size {} error {}",
-                        blk_id,
-                        off % FS_BLK_SIZE,
-                        sz,
-                        e
-                    );
+                    log::error!("can't read data ino {} off {} size {} error {}", ino, off, sz, e);
                     None
                 }
             }
@@ -146,24 +287,17 @@ impl Store for FileStore {
         let mut sz = 0;
         let mut inode = meta.load_inode(ino).expect("can't load inode");
 
-        let mut affected_blks = std::collections::HashSet::new();
-
         for e in buf {
             sz = max(sz, e.off + e.size);
             if !self.write_impl(ino, e) {
-                log::warn!("write {}_{} fail", ino, e.blk_id);
+                log::warn!("write {} fail", ino);
                 return;
             }
-            affected_blks.insert(e.blk_id);
         }
 
         // ensure data is on disk before updating metadata
-        for blk_id in affected_blks {
-            let key = Self::write_key(ino, blk_id);
-            let res = Self::get_fp_and_then(key, ino, blk_id, |fp| fp.sync_all().map_err(|e| e.to_string()));
-            if let Some(Err(e)) = res {
-                log::error!("can't sync file {}_{} error {}", ino, blk_id, e);
-            }
+        if !Self::sync_file(ino, true) {
+            log::error!("can't sync data file for ino {}", ino);
         }
 
         let now = std::time::SystemTime::now()
@@ -190,4 +324,3 @@ impl Store for FileStore {
         self.read_impl(ino, off, size)
     }
 }
-

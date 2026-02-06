@@ -1,7 +1,7 @@
 use crate::utils::align_up;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BitMap {
     data: Vec<u8>,
     size: u64,

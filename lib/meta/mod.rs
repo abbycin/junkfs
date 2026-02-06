@@ -102,7 +102,6 @@ impl DirHandle {
     }
 }
 
-
 impl Drop for DirHandle {
     fn drop(&mut self) {
         log::info!("drop DirHandle fh {} entry size {}", self.fh, self.entry.len());

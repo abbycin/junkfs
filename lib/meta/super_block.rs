@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 // NOTE: we use a key-value database to store metadata of filesystem, so it's unnecessary to store
 // inode map, data map and inode table in metadata, we only limit the total number of data blocks
 // and inode count is enough
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SuperBlock {
     ino: Ino,
     uri: String, // currently the `uri` is a path to store file blocks

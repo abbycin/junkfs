@@ -1,7 +1,7 @@
 use crate::cache::MemPool;
 use crate::meta::{DirHandle, FileHandle, Ino, Itype, Meta};
 use crate::store::FileStore;
-use crate::utils::{to_attr, to_filetype, BitMap, FS_BLK_SIZE};
+use crate::utils::{to_attr, to_filetype, BitMap};
 use fuser::{
     Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
     Request, TimeOrNow,
@@ -157,19 +157,29 @@ impl Filesystem for Fs {
                 if let Some(x) = gid {
                     inode.gid = x;
                 }
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 if let Some(x) = _size {
                     if x < inode.length {
                         let f_handles = self.file_handles.lock().unwrap();
                         for h in f_handles.values() {
                             let mut f = h.lock().unwrap();
                             if f.ino == ino {
+                                f.flush(&mut meta);
                                 f.clear();
                             }
                         }
                     }
+                    if let Err(e) = FileStore::set_len(ino, x) {
+                        log::error!("can't set_len ino {} size {} error {}", ino, x, e);
+                        reply.error(EFAULT);
+                        return;
+                    }
+                    if x != inode.length {
+                        inode.mtime = now;
+                        inode.ctime = now;
+                    }
                     inode.length = x;
                 }
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 if let Some(x) = _atime {
                     inode.atime = match x {
                         TimeOrNow::Now => now,
@@ -181,6 +191,9 @@ impl Filesystem for Fs {
                         TimeOrNow::Now => now,
                         TimeOrNow::SpecificTime(t) => t.duration_since(UNIX_EPOCH).unwrap().as_secs(),
                     };
+                }
+                if let Some(x) = _ctime {
+                    inode.ctime = x.duration_since(UNIX_EPOCH).unwrap().as_secs();
                 }
                 meta.store_inode(&inode).unwrap();
                 let attr = to_attr(&inode);
@@ -244,10 +257,22 @@ impl Filesystem for Fs {
         }
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
         let mut meta = self.meta.lock().unwrap();
         if let Some(h) = self.find_file_handle(fh) {
             h.lock().unwrap().flush(&mut meta);
+            if let Err(e) = FileStore::fsync(ino, datasync) {
+                log::error!("can't fsync ino {} error {}", ino, e);
+                reply.error(EFAULT);
+                return;
+            }
+            if !datasync {
+                if let Err(e) = meta.sync() {
+                    log::error!("can't sync metadata for ino {} error {}", ino, e);
+                    reply.error(EFAULT);
+                    return;
+                }
+            }
             reply.ok();
         } else {
             reply.error(ENOENT);
@@ -310,6 +335,16 @@ impl Filesystem for Fs {
 
     fn releasedir(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
         self.remove_dir_handle(fh);
+        reply.ok();
+    }
+
+    fn fsyncdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        let meta = self.meta.lock().unwrap();
+        if let Err(e) = meta.sync() {
+            log::error!("can't fsyncdir ino {} error {}", ino, e);
+            reply.error(EFAULT);
+            return;
+        }
         reply.ok();
     }
 
@@ -382,11 +417,7 @@ impl Filesystem for Fs {
         match meta.unlink(parent, &name.to_string_lossy()) {
             Ok(inode) => {
                 if inode.kind == Itype::File && inode.links == 0 {
-                    let mut i = 0;
-                    while i <= inode.length {
-                        FileStore::unlink(inode.id, i / FS_BLK_SIZE);
-                        i += FS_BLK_SIZE;
-                    }
+                    FileStore::unlink(inode.id);
                 }
                 reply.ok();
             }

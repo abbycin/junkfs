@@ -5,6 +5,7 @@ use crate::meta::{Ino, Meta};
 pub use cache_store::CacheStore;
 pub use filestore::FileStore;
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct Entry {
     blk_id: u64,   // block id
