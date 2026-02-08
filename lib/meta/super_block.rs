@@ -81,7 +81,7 @@ impl MetaKV for SuperBlock {
     }
 }
 
-const SUPERBLOCK_VERSION: u32 = 2;
+const SUPERBLOCK_VERSION: u32 = 3;
 
 #[cfg(test)]
 mod test {

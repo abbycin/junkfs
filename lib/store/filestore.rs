@@ -13,6 +13,7 @@ use std::time::Instant;
 const MAX_CACHE_ITEMS: usize = 256;
 const DATA_SHARD_BITS: u64 = 8;
 const DATA_SHARD_MASK: u64 = (1 << DATA_SHARD_BITS) - 1;
+const DATA_SHARD_GROUP_SIZE: u64 = 4096;
 
 struct FileFlusher;
 
@@ -48,8 +49,9 @@ impl FileStore {
     }
 
     fn shard(ino: Ino) -> (u8, u8) {
-        let s1 = (ino & DATA_SHARD_MASK) as u8;
-        let s2 = ((ino >> DATA_SHARD_BITS) & DATA_SHARD_MASK) as u8;
+        let bucket = ino / DATA_SHARD_GROUP_SIZE;
+        let s1 = (bucket & DATA_SHARD_MASK) as u8;
+        let s2 = ((bucket >> DATA_SHARD_BITS) & DATA_SHARD_MASK) as u8;
         (s1, s2)
     }
 
@@ -90,20 +92,12 @@ impl FileStore {
             log::error!("can't create data root {} error {}", root, e);
             return Err(e.to_string());
         }
-        if let Some(parent) = Path::new(root).parent().and_then(|p| p.to_str()) {
-            Self::fsync_dir(parent);
-        }
-        Self::fsync_dir(root);
         Ok(())
     }
 
     fn ensure_dir(path: &str, parent: &str) -> Result<(), String> {
         match std::fs::create_dir(path) {
-            Ok(_) => {
-                Self::fsync_dir(parent);
-                Self::fsync_dir(path);
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
             Err(e) => {
                 log::error!("can't create dir {} error {}", path, e);

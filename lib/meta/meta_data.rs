@@ -97,7 +97,7 @@ impl Meta {
                     Ok(sb) => {
                         // TODO: check consistency
                         sb.check();
-                        if sb.version() != 2 {
+                        if sb.version() != 3 {
                             return Err("unsupported superblock version".to_string());
                         }
                         let sum = meta.get(&InoMap::summary_key()).map_err(|e| e.to_string())?;
