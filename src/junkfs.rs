@@ -3,7 +3,7 @@ use junkfs::logger::Logger;
 use std::str::FromStr;
 
 fn main() {
-    let level = std::env::var("JUNK_LEVEL").unwrap_or("INFO".to_string());
+    let level = std::env::var("JUNK_LEVEL").unwrap_or("ERROR".to_string());
     let log_path = "/tmp/junkfs.log";
     Logger::init().add_file(log_path, true);
     log::set_max_level(log::LevelFilter::from_str(&level).unwrap());

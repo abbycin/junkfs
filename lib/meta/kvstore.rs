@@ -17,9 +17,9 @@ impl Flusher<String, Vec<u8>> for MaceStore {
 impl MaceStore {
     pub fn new(meta_path: &str) -> Self {
         let mut opt = Options::new(meta_path);
-        opt.concurrent_write = 1;
-        opt.wal_file_size = 16 << 20;
-        opt.max_log_size = 24 << 20;
+        opt.concurrent_write = 4;
+        opt.wal_file_size = 32 << 20;
+        opt.max_log_size = 64 << 20;
         opt.gc_eager = true;
         opt.data_garbage_ratio = 10;
         opt.gc_timeout = 10000; // 10s
@@ -55,6 +55,19 @@ impl MaceStore {
                 Err(e)
             }
             Ok(o) => Ok(o.slice().to_vec()),
+        }
+    }
+
+    pub fn get_optional(&self, key: &str) -> Result<Option<Vec<u8>>, OpCode> {
+        let view = self.bucket.view()?;
+        let x = view.get(key);
+        match x {
+            Err(OpCode::NotFound) => Ok(None),
+            Err(e) => {
+                log::error!("get {} fail, error {:?}", key, e);
+                Err(e)
+            }
+            Ok(o) => Ok(Some(o.slice().to_vec())),
         }
     }
 

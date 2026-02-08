@@ -1,13 +1,15 @@
 use crate::cache::{Flusher, LRUCache};
-use crate::meta::{Ino, Meta};
-use crate::store::{Entry, Store};
+use crate::meta::Ino;
+use crate::store::{record_pwritev, Entry};
 use crate::utils::{get_data_path, FS_FUSE_MAX_IO_SIZE};
 use once_cell::sync::Lazy;
-use std::cmp::{max, min};
+use std::cmp::min;
 use std::io::ErrorKind;
+use std::os::unix::prelude::AsRawFd;
 use std::os::unix::prelude::FileExt;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Instant;
 const MAX_CACHE_ITEMS: usize = 256;
 const DATA_SHARD_BITS: u64 = 8;
 const DATA_SHARD_MASK: u64 = (1 << DATA_SHARD_BITS) - 1;
@@ -204,13 +206,10 @@ impl FileStore {
 
     pub fn set_len(ino: Ino, size: u64) -> Result<(), String> {
         let key = Self::file_key(ino);
-        let res = Self::get_fp_and_then(key, ino, true, |fp| {
-            fp.set_len(size)?;
-            fp.sync_all()
-        });
+        let res = Self::get_fp_and_then(key, ino, true, |fp| fp.set_len(size).map_err(|e| e.to_string()));
         match res {
             Some(Ok(())) => Ok(()),
-            Some(Err(e)) => Err(e.to_string()),
+            Some(Err(e)) => Err(e),
             None => Err("can't open data file".to_string()),
         }
     }
@@ -243,22 +242,64 @@ impl FileStore {
         }
     }
 
-    fn write_impl(&mut self, ino: Ino, e: &Entry) -> bool {
-        let key = Self::file_key(ino);
-        Self::get_fp_and_then(key, ino, true, |fp| unsafe {
-            let s = std::slice::from_raw_parts(e.data, e.size as usize);
-            let r = fp.write_at(s, e.off);
-            if let Err(err) = r {
-                log::error!("can't write entry {:?} error {}", e, err);
-                false
-            } else {
-                true
+    fn write_entries_inner(fp: &mut std::fs::File, buf: &[Entry]) -> Result<(), String> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let fd = fp.as_raw_fd();
+        let max_iov = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
+        let max_iov = if max_iov <= 0 { 128 } else { max_iov as usize };
+        let mut i = 0;
+        while i < buf.len() {
+            let start_off = buf[i].off;
+            let mut expected = start_off;
+            let mut iovecs: Vec<libc::iovec> = Vec::new();
+            while i < buf.len() && buf[i].off == expected {
+                let e = &buf[i];
+                iovecs.push(libc::iovec {
+                    iov_base: e.data as *mut libc::c_void,
+                    iov_len: e.size as usize,
+                });
+                expected += e.size;
+                i += 1;
+                if iovecs.len() >= max_iov {
+                    break;
+                }
             }
-        })
-        .unwrap_or(false)
+            let total = expected - start_off;
+            let start = Instant::now();
+            let n = unsafe { libc::pwritev(fd, iovecs.as_ptr(), iovecs.len() as i32, start_off as libc::off_t) };
+            let ns = start.elapsed().as_nanos() as u64;
+            if n < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            if n as u64 != total {
+                return Err("short write".to_string());
+            }
+            record_pwritev(total, ns);
+        }
+        Ok(())
     }
 
-    fn read_impl(&mut self, ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {
+    pub(crate) fn write_entries(ino: Ino, buf: &[Entry], sync: bool) -> Result<(), String> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let key = Self::file_key(ino);
+        let res = Self::get_fp_and_then(key, ino, true, |fp| Self::write_entries_inner(fp, buf));
+        match res {
+            Some(Ok(())) => {
+                if sync && !Self::sync_file(ino, true) {
+                    return Err("can't sync file".to_string());
+                }
+                Ok(())
+            }
+            Some(Err(e)) => Err(e),
+            None => Err("can't open data file".to_string()),
+        }
+    }
+
+    pub fn read_at(ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {
         let key = Self::file_key(ino);
         let sz = min(FS_FUSE_MAX_IO_SIZE, size as u64) as usize;
 
@@ -276,51 +317,5 @@ impl FileStore {
             }
         })
         .flatten()
-    }
-}
-
-impl Store for FileStore {
-    fn write(&mut self, meta: &mut Meta, ino: Ino, buf: &[Entry]) {
-        if buf.is_empty() {
-            return;
-        }
-        let mut sz = 0;
-        let mut inode = meta.load_inode(ino).expect("can't load inode");
-
-        for e in buf {
-            sz = max(sz, e.off + e.size);
-            if !self.write_impl(ino, e) {
-                log::warn!("write {} fail", ino);
-                return;
-            }
-        }
-
-        // ensure data is on disk before updating metadata
-        if !Self::sync_file(ino, true) {
-            log::error!("can't sync data file for ino {}", ino);
-        }
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        inode.mtime = now;
-        inode.ctime = now;
-
-        // try update inode.length
-        if inode.length < sz {
-            log::info!("trying to update inode.length {} to {}", inode.length, sz);
-            inode.length = sz;
-        }
-        meta.store_inode(&inode).unwrap()
-    }
-
-    fn read(&mut self, meta: &mut Meta, ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {
-        let inode = meta.load_inode(ino).expect("can't load inode");
-        if off >= inode.length {
-            return Some(Vec::new());
-        }
-        let size = min(size as u64, inode.length - off) as usize;
-        self.read_impl(ino, off, size)
     }
 }

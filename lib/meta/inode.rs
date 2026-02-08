@@ -8,7 +8,7 @@ pub enum Itype {
     Symlink,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
 pub struct Inode {
     pub id: Ino,
     pub parent: Ino,

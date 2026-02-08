@@ -1,4 +1,5 @@
 mod dentry;
+mod imap;
 mod inode;
 mod kvstore;
 mod meta_data;
@@ -8,6 +9,7 @@ use crate::meta::meta_data::NameT;
 use crate::store::CacheStore;
 pub use inode::{Inode, Itype};
 pub use meta_data::{Ino, Meta};
+use std::sync::{Arc, Mutex};
 
 pub trait MetaKV {
     fn key(&self) -> String;
@@ -18,32 +20,28 @@ pub trait MetaKV {
 pub struct FileHandle {
     pub ino: Ino,
     pub fh: u64,
-    cache: CacheStore,
+    cache: Arc<Mutex<CacheStore>>,
 }
 
 impl FileHandle {
-    pub fn new(ino: Ino, fh: u64) -> Self {
-        Self {
-            ino,
-            fh,
-            cache: CacheStore::new(ino),
-        }
+    pub fn new(ino: Ino, fh: u64, cache: Arc<Mutex<CacheStore>>) -> Self {
+        Self { ino, fh, cache }
     }
 
-    pub fn write(&mut self, meta: &mut Meta, off: u64, data: &[u8]) -> usize {
-        self.cache.write(meta, off, data)
+    pub fn write(&mut self, off: u64, data: &[u8]) -> usize {
+        self.cache.lock().unwrap().write(off, data)
     }
 
-    pub fn flush(&mut self, meta: &mut Meta) {
-        self.cache.flush(meta);
+    pub fn flush(&mut self, sync: bool) {
+        let _ = self.cache.lock().unwrap().flush(sync);
     }
 
     pub fn clear(&mut self) {
-        self.cache.clear();
+        self.cache.lock().unwrap().clear();
     }
 
-    pub fn read(&mut self, meta: &mut Meta, off: u64, size: usize) -> Option<Vec<u8>> {
-        self.cache.read(meta, off, size)
+    pub fn read(&mut self, off: u64, size: usize) -> Option<Vec<u8>> {
+        self.cache.lock().unwrap().read(off, size)
     }
 }
 
