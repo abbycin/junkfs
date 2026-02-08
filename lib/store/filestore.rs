@@ -21,9 +21,8 @@ static mut G_LUSHER: FileFlusher = FileFlusher;
 
 impl Flusher<String, std::fs::File> for FileFlusher {
     fn flush(&mut self, key: String, data: std::fs::File) {
-        let file = data;
-        file.sync_all().unwrap_or_else(|_| panic!("can't sync file {}", key));
-        drop(file);
+        let _ = key;
+        drop(data);
     }
 }
 
@@ -70,19 +69,6 @@ impl FileStore {
         format!("{}/{:02x}/{:02x}/{}", get_data_path(), s1, s2, ino)
     }
 
-    fn fsync_dir(path: &str) {
-        match std::fs::File::open(path) {
-            Ok(dir) => {
-                if let Err(e) = dir.sync_all() {
-                    log::error!("can't sync dir {} error {}", path, e);
-                }
-            }
-            Err(e) => {
-                log::error!("can't open dir {} error {}", path, e);
-            }
-        }
-    }
-
     fn ensure_root_dir() -> Result<(), String> {
         let root = get_data_path().as_str();
         if Path::new(root).exists() {
@@ -95,7 +81,7 @@ impl FileStore {
         Ok(())
     }
 
-    fn ensure_dir(path: &str, parent: &str) -> Result<(), String> {
+    fn ensure_dir(path: &str) -> Result<(), String> {
         match std::fs::create_dir(path) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
@@ -108,11 +94,10 @@ impl FileStore {
 
     fn ensure_dirs(ino: Ino) -> Result<(), String> {
         Self::ensure_root_dir()?;
-        let root = get_data_path().as_str();
         let dir1 = Self::build_dir1(ino);
         let dir2 = Self::build_dir(ino);
-        Self::ensure_dir(&dir1, root)?;
-        Self::ensure_dir(&dir2, &dir1)?;
+        Self::ensure_dir(&dir1)?;
+        Self::ensure_dir(&dir2)?;
         Ok(())
     }
 
@@ -135,7 +120,6 @@ impl FileStore {
             return None;
         }
         let fpath = Self::build_path(ino);
-        let dir = Self::build_dir(ino);
         match std::fs::File::options()
             .read(true)
             .write(true)
@@ -143,7 +127,6 @@ impl FileStore {
             .open(&fpath)
         {
             Ok(fp) => {
-                Self::fsync_dir(&dir);
                 Some(fp)
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -229,8 +212,6 @@ impl FileStore {
                 }
             }
             Ok(_) => {
-                let dir = Self::build_dir(ino);
-                Self::fsync_dir(&dir);
                 log::info!("remove file {}", p);
             }
         }
@@ -287,6 +268,48 @@ impl FileStore {
                     return Err("can't sync file".to_string());
                 }
                 Ok(())
+            }
+            Some(Err(e)) => Err(e),
+            None => Err("can't open data file".to_string()),
+        }
+    }
+
+    fn write_at_inner(fp: &mut std::fs::File, off: u64, data: &[u8]) -> Result<usize, String> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let fd = fp.as_raw_fd();
+        let mut written = 0usize;
+        let start = Instant::now();
+        while written < data.len() {
+            let ptr = unsafe { data.as_ptr().add(written) } as *const libc::c_void;
+            let len = data.len() - written;
+            let n = unsafe { libc::pwrite(fd, ptr, len, (off + written as u64) as libc::off_t) };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            if n == 0 {
+                return Err("short write".to_string());
+            }
+            written += n as usize;
+        }
+        let ns = start.elapsed().as_nanos() as u64;
+        record_pwritev(written as u64, ns);
+        Ok(written)
+    }
+
+    pub(crate) fn write_at(ino: Ino, off: u64, data: &[u8], sync: bool) -> Result<usize, String> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let key = Self::file_key(ino);
+        let res = Self::get_fp_and_then(key, ino, true, |fp| Self::write_at_inner(fp, off, data));
+        match res {
+            Some(Ok(n)) => {
+                if sync && !Self::sync_file(ino, true) {
+                    return Err("can't sync file".to_string());
+                }
+                Ok(n)
             }
             Some(Err(e)) => Err(e),
             None => Err("can't open data file".to_string()),

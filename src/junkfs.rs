@@ -29,6 +29,8 @@ fn main() {
             let options = vec![
                 fuser::MountOption::FSName("jfs".to_string()),
                 fuser::MountOption::Subtype("jfs".to_string()),
+                fuser::MountOption::CUSTOM("writeback_cache".to_string()),
+                fuser::MountOption::Async,
                 // fuser::MountOption::AutoUnmount,
             ];
             println!("Starting FUSE mount at {:?}...", mount_point);

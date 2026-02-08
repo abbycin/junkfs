@@ -16,11 +16,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-#[cfg(feature = "stats")]
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WRITEBACK_INTERVAL_MS: u64 = 100;
+const META_COMMIT_INTERVAL_MS: u64 = 200;
+const META_COMMIT_THRESHOLD: usize = 8192;
 
 struct Writeback {
     stop: Arc<AtomicBool>,
@@ -32,6 +32,7 @@ impl Writeback {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let handle = thread::spawn(move || {
+            let mut last_commit = Instant::now();
             #[cfg(feature = "stats")]
             let mut last_log = Instant::now();
             loop {
@@ -57,6 +58,11 @@ impl Writeback {
                 }
             }
                 let _ = meta.flush_dirty_inodes();
+                let pending = meta.pending_len();
+                if pending >= META_COMMIT_THRESHOLD || last_commit.elapsed() >= Duration::from_millis(META_COMMIT_INTERVAL_MS) {
+                    let _ = meta.commit_pending();
+                    last_commit = Instant::now();
+                }
                 #[cfg(feature = "stats")]
                 {
                     if last_log.elapsed() >= Duration::from_secs(5) {
@@ -110,7 +116,7 @@ impl Fs {
             return Err(meta.err().unwrap());
         }
 
-        MemPool::init(100 << 20);
+        MemPool::init(512 << 20);
 
         let meta = Arc::new(meta.unwrap());
         let inode_caches = Arc::new(Mutex::new(HashMap::new()));
@@ -228,7 +234,8 @@ impl Filesystem for Fs {
         }
     }
 
-    fn init(&mut self, _req: &Request<'_>, _cfg: &mut fuser::KernelConfig) -> Result<(), i32> {
+    fn init(&mut self, _req: &Request<'_>, cfg: &mut fuser::KernelConfig) -> Result<(), i32> {
+        let _ = cfg.set_max_write(16 << 20);
         let meta = &self.meta;
         if meta.load_inode(1).is_some() {
             Ok(())
@@ -417,6 +424,11 @@ impl Filesystem for Fs {
             if datasync {
                 if let Err(e) = meta.flush_inode(ino) {
                     log::error!("can't sync inode {} error {}", ino, e);
+                    reply.error(EFAULT);
+                    return;
+                }
+                if let Err(e) = meta.commit_pending() {
+                    log::error!("can't commit metadata error {}", e);
                     reply.error(EFAULT);
                     return;
                 }

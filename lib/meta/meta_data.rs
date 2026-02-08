@@ -1,3 +1,4 @@
+use crate::cache::LRUCache;
 use crate::meta::dentry::Dentry;
 use crate::meta::imap::InoMap;
 use crate::meta::inode::{Inode, Itype};
@@ -7,7 +8,7 @@ use crate::meta::{DirHandle, MetaKV};
 use crate::utils::{init_data_path, BitMap64};
 use libc::{EEXIST, EFAULT, ENOENT, ENOTEMPTY};
 use mace::{Mace, OpCode, Options};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,7 +35,43 @@ pub struct Meta {
     pub meta: MaceStore,
     state: Mutex<MetaState>,
     inode_cache: RwLock<HashMap<Ino, InodeCache>>,
+    pending: Mutex<Pending>,
+    dentry_cache: Mutex<LRUCache<String, DentryCacheValue>>,
+    dir_index: Mutex<HashMap<Ino, DirIndex>>,
 }
+
+struct Pending {
+    puts: HashMap<String, Vec<u8>>,
+    dels: HashSet<String>,
+}
+
+impl Pending {
+    fn new() -> Self {
+        Self {
+            puts: HashMap::new(),
+            dels: HashSet::new(),
+        }
+    }
+}
+
+enum PendingValue {
+    Put(Vec<u8>),
+    Deleted,
+    Missing,
+}
+
+#[derive(Clone, Copy)]
+enum DentryCacheValue {
+    Present(Ino),
+    Absent,
+}
+
+struct DirIndex {
+    loaded: bool,
+    entries: HashMap<String, Ino>,
+}
+
+const DENTRY_CACHE_CAP: usize = 1 << 18;
 
 impl Meta {
     // write superblock
@@ -111,11 +148,267 @@ impl Meta {
                             meta,
                             state: Mutex::new(state),
                             inode_cache: RwLock::new(HashMap::new()),
+                            pending: Mutex::new(Pending::new()),
+                            dentry_cache: Mutex::new(LRUCache::new(DENTRY_CACHE_CAP)),
+                            dir_index: Mutex::new(HashMap::new()),
                         })
                     }
                 }
             }
         }
+    }
+
+    fn stage_put(&self, key: String, val: Vec<u8>) {
+        self.maybe_cache_dentry_put(&key, &val);
+        self.maybe_index_dentry_put(&key, &val);
+        let mut pending = self.pending.lock().unwrap();
+        pending.dels.remove(&key);
+        pending.puts.insert(key, val);
+    }
+
+    fn stage_del(&self, key: String) {
+        self.maybe_cache_dentry_del(&key);
+        self.maybe_index_dentry_del(&key);
+        let mut pending = self.pending.lock().unwrap();
+        pending.puts.remove(&key);
+        pending.dels.insert(key);
+    }
+
+    fn dentry_cache_get(&self, key: &str) -> Option<DentryCacheValue> {
+        let mut cache = self.dentry_cache.lock().unwrap();
+        let k = key.to_string();
+        cache.get_mut(&k).copied()
+    }
+
+    fn dentry_cache_put(&self, key: String, val: DentryCacheValue) {
+        let mut cache = self.dentry_cache.lock().unwrap();
+        cache.add(key, val);
+    }
+
+    fn maybe_cache_dentry_put(&self, key: &str, val: &[u8]) {
+        if !key.starts_with("d_") {
+            return;
+        }
+        if let Ok(de) = bincode::deserialize::<Dentry>(val) {
+            self.dentry_cache_put(key.to_string(), DentryCacheValue::Present(de.ino));
+        }
+    }
+
+    fn maybe_cache_dentry_del(&self, key: &str) {
+        if !key.starts_with("d_") {
+            return;
+        }
+        self.dentry_cache_put(key.to_string(), DentryCacheValue::Absent);
+    }
+
+    fn maybe_index_dentry_put(&self, key: &str, val: &[u8]) {
+        if let Some((parent, name)) = Self::parse_dentry_key(key) {
+            if let Ok(de) = bincode::deserialize::<Dentry>(val) {
+                self.dir_index_put(parent, name, de.ino);
+            }
+        }
+    }
+
+    fn maybe_index_dentry_del(&self, key: &str) {
+        if let Some((parent, name)) = Self::parse_dentry_key(key) {
+            self.dir_index_del(parent, &name);
+        }
+    }
+
+    fn pending_for_prefix(&self, prefix: &str) -> (Vec<(String, Vec<u8>)>, HashSet<String>) {
+        let pending = self.pending.lock().unwrap();
+        let puts = pending
+            .puts
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>();
+        let dels = pending
+            .dels
+            .iter()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect::<HashSet<_>>();
+        (puts, dels)
+    }
+
+    fn parse_dentry_key(key: &str) -> Option<(Ino, String)> {
+        if !key.starts_with("d_") {
+            return None;
+        }
+        let rest = &key[2..];
+        let mut it = rest.splitn(2, '_');
+        let parent_str = it.next()?;
+        let name = it.next()?;
+        let parent = parent_str.parse::<Ino>().ok()?;
+        Some((parent, name.to_string()))
+    }
+
+    fn dir_index_put(&self, parent: Ino, name: String, ino: Ino) {
+        let mut map = self.dir_index.lock().unwrap();
+        let idx = map.entry(parent).or_insert(DirIndex {
+            loaded: false,
+            entries: HashMap::new(),
+        });
+        idx.entries.insert(name, ino);
+    }
+
+    fn dir_index_del(&self, parent: Ino, name: &str) {
+        let mut map = self.dir_index.lock().unwrap();
+        if let Some(idx) = map.get_mut(&parent) {
+            idx.entries.remove(name);
+        }
+    }
+
+    fn dir_index_lookup(&self, parent: Ino, name: &str) -> Option<Option<Ino>> {
+        let map = self.dir_index.lock().unwrap();
+        if let Some(idx) = map.get(&parent) {
+            if idx.loaded {
+                return Some(idx.entries.get(name).copied());
+            }
+        }
+        None
+    }
+
+    fn dir_index_has_entries(&self, ino: Ino) -> Option<bool> {
+        let map = self.dir_index.lock().unwrap();
+        if let Some(idx) = map.get(&ino) {
+            if idx.loaded {
+                return Some(!idx.entries.is_empty());
+            }
+        }
+        None
+    }
+
+    fn build_dir_index(&self, parent: Ino) -> HashMap<String, Ino> {
+        let prefix = Dentry::prefix(parent);
+        let mut entries = HashMap::new();
+        let view = self.meta.view();
+        let iter = view.seek(&prefix);
+        for item in iter {
+            if !item.key().starts_with(prefix.as_bytes()) {
+                break;
+            }
+            let de = bincode::deserialize::<Dentry>(item.val()).expect("can't deserialize dentry");
+            entries.insert(de.name, de.ino);
+        }
+        let (pending_puts, pending_dels) = self.pending_for_prefix(&prefix);
+        for key in pending_dels {
+            if let Some((_, name)) = Self::parse_dentry_key(&key) {
+                entries.remove(&name);
+            }
+        }
+        for (_, data) in pending_puts {
+            let de = bincode::deserialize::<Dentry>(&data).expect("can't deserialize dentry");
+            entries.insert(de.name, de.ino);
+        }
+        entries
+    }
+
+    fn ensure_dir_index_loaded(&self, parent: Ino) {
+        let need_load = {
+            let map = self.dir_index.lock().unwrap();
+            match map.get(&parent) {
+                Some(idx) => !idx.loaded,
+                None => true,
+            }
+        };
+        if !need_load {
+            return;
+        }
+        let entries = self.build_dir_index(parent);
+        let mut map = self.dir_index.lock().unwrap();
+        let idx = map.entry(parent).or_insert(DirIndex {
+            loaded: true,
+            entries: HashMap::new(),
+        });
+        idx.entries = entries;
+        idx.loaded = true;
+    }
+
+    fn pending_get(&self, key: &str) -> PendingValue {
+        let pending = self.pending.lock().unwrap();
+        if pending.dels.contains(key) {
+            return PendingValue::Deleted;
+        }
+        if let Some(v) = pending.puts.get(key) {
+            return PendingValue::Put(v.clone());
+        }
+        PendingValue::Missing
+    }
+
+    pub fn commit_pending(&self) -> Result<(), String> {
+        let (puts, dels) = {
+            let pending = self.pending.lock().unwrap();
+            if pending.puts.is_empty() && pending.dels.is_empty() {
+                return Ok(());
+            }
+            (
+                pending.puts.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+                pending.dels.iter().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let kv = self.meta.begin().map_err(|e| e.to_string())?;
+        for (k, v) in &puts {
+            kv.upsert(k, v).map_err(|e| e.to_string())?;
+        }
+        for k in &dels {
+            kv.del(k).map_err(|e| e.to_string())?;
+        }
+        kv.commit().map_err(|e| e.to_string())?;
+        let mut pending = self.pending.lock().unwrap();
+        for (k, v) in puts {
+            if let Some(cur) = pending.puts.get(&k) {
+                if *cur == v {
+                    pending.puts.remove(&k);
+                }
+            }
+        }
+        for k in dels {
+            if pending.dels.contains(&k) && !pending.puts.contains_key(&k) {
+                pending.dels.remove(&k);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn pending_len(&self) -> usize {
+        let pending = self.pending.lock().unwrap();
+        pending.puts.len() + pending.dels.len()
+    }
+
+    fn dir_has_entries(&self, ino: Ino) -> bool {
+        if let Some(has) = self.dir_index_has_entries(ino) {
+            return has;
+        }
+        let prefix = Dentry::prefix(ino);
+        let (has_puts, dels) = {
+            let pending = self.pending.lock().unwrap();
+            let has_puts = pending.puts.keys().any(|k| k.starts_with(&prefix));
+            let dels = pending
+                .dels
+                .iter()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect::<HashSet<_>>();
+            (has_puts, dels)
+        };
+        if has_puts {
+            return true;
+        }
+        let view = self.meta.view();
+        let mut it = view.seek(&prefix);
+        while let Some(item) = it.next() {
+            if !item.key().starts_with(prefix.as_bytes()) {
+                break;
+            }
+            let key = String::from_utf8_lossy(item.key()).to_string();
+            if dels.contains(&key) {
+                continue;
+            }
+            return true;
+        }
+        false
     }
 
     fn repair_imap_summary(meta: &MaceStore, sb: &SuperBlock, imap: &mut InoMap) -> Result<(), String> {
@@ -214,7 +507,7 @@ impl Meta {
             return Ok(());
         }
         for inode in &dirty {
-            self.meta.insert(&Inode::key(inode.id), &inode.val()).map_err(|e| e.to_string())?;
+            self.stage_put(Inode::key(inode.id), inode.val());
         }
         let mut cache = self.inode_cache.write().unwrap();
         for inode in dirty {
@@ -238,7 +531,7 @@ impl Meta {
         if !entry.dirty {
             return Ok(());
         }
-        self.meta.insert(&Inode::key(entry.inode.id), &entry.inode.val()).map_err(|e| e.to_string())?;
+        self.stage_put(Inode::key(entry.inode.id), entry.inode.val());
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(e) = cache.get_mut(&ino) {
             if e.inode == entry.inode {
@@ -249,21 +542,21 @@ impl Meta {
     }
 
     pub fn store(&self, key: &str, value: &[u8]) {
-        match self.meta.insert(key, value) {
-            Ok(_) => {}
-            Err(e) => {
-                log::info!("insert key {} fail, error {:?}", key, e)
-            }
-        }
+        self.stage_put(key.to_string(), value.to_vec());
     }
 
     pub fn load(&self, key: &str) -> Option<Vec<u8>> {
-        match self.meta.get(key) {
-            Err(e) => {
-                log::error!("can't load key {} error {}", key, e);
-                None
-            }
-            Ok(x) => Some(x),
+        match self.pending_get(key) {
+            PendingValue::Put(v) => Some(v),
+            PendingValue::Deleted => None,
+            PendingValue::Missing => match self.meta.get_optional(key) {
+                Ok(Some(x)) => Some(x),
+                Ok(None) => None,
+                Err(e) => {
+                    log::error!("can't load key {} error {}", key, e);
+                    None
+                }
+            },
         }
     }
 
@@ -271,6 +564,7 @@ impl Meta {
 
     pub fn sync(&self) -> Result<(), String> {
         self.flush_dirty_inodes()?;
+        self.commit_pending()?;
         self.meta.sync().map_err(|e| e.to_string())
     }
 
@@ -290,14 +584,42 @@ impl Meta {
     /// - if existed, load Inode from database
     /// - or else, return None
     pub fn lookup(&self, parent: Ino, name: &str) -> Option<Inode> {
-        let parent = Dentry::key(parent, name);
-        match self.meta.get_optional(&parent) {
-            Ok(Some(dentry)) => {
+        let key = Dentry::key(parent, name);
+        match self.pending_get(&key) {
+            PendingValue::Put(dentry) => {
                 let dentry = bincode::deserialize::<Dentry>(&dentry).expect("can't deserialize dentry");
                 self.load_inode(dentry.ino)
             }
-            Ok(None) => None,
-            Err(_) => None,
+            PendingValue::Deleted => None,
+            PendingValue::Missing => match self.dentry_cache_get(&key) {
+                Some(DentryCacheValue::Present(ino)) => self.load_inode(ino),
+                Some(DentryCacheValue::Absent) => None,
+                None => {
+                    self.ensure_dir_index_loaded(parent);
+                    match self.dir_index_lookup(parent, name) {
+                        Some(Some(ino)) => {
+                            self.dentry_cache_put(key, DentryCacheValue::Present(ino));
+                            self.load_inode(ino)
+                        }
+                        Some(None) => {
+                            self.dentry_cache_put(key, DentryCacheValue::Absent);
+                            None
+                        }
+                        None => match self.meta.get_optional(&key) {
+                            Ok(Some(dentry)) => {
+                                let dentry = bincode::deserialize::<Dentry>(&dentry).expect("can't deserialize dentry");
+                                self.dentry_cache_put(key, DentryCacheValue::Present(dentry.ino));
+                                self.load_inode(dentry.ino)
+                            }
+                            Ok(None) => {
+                                self.dentry_cache_put(key, DentryCacheValue::Absent);
+                                None
+                            }
+                            Err(_) => None,
+                        },
+                    }
+                }
+            },
         }
     }
 
@@ -338,12 +660,10 @@ impl Meta {
         let dkey = Dentry::key(parent, name.as_ref());
         let de = Dentry::new(parent, ino, name.as_ref());
 
-        let kv = self.meta.begin().map_err(|_| EFAULT)?;
-        kv.upsert(InoMap::summary_key(), plan.summary_val()).map_err(|_| EFAULT)?;
-        kv.upsert(InoMap::group_key(plan.gid), plan.group_val()).map_err(|_| EFAULT)?;
-        kv.put(Inode::key(ino), inode.val()).map_err(|_| EFAULT)?;
-        kv.put(dkey, de.val()).map_err(|_| EFAULT)?;
-        kv.commit().map_err(|_| EFAULT)?;
+        self.stage_put(InoMap::summary_key(), plan.summary_val());
+        self.stage_put(InoMap::group_key(plan.gid), plan.group_val());
+        self.stage_put(Inode::key(ino), inode.val());
+        self.stage_put(dkey, de.val());
 
         state.imap.apply_alloc(plan);
         drop(state);
@@ -355,16 +675,12 @@ impl Meta {
         let mut inode = self.lookup(parent, name).ok_or(ENOENT)?;
 
         if inode.kind == Itype::Dir {
-            let prefix = Dentry::prefix(inode.id);
-            let view = self.meta.view();
-            let mut it = view.seek(&prefix);
-            if it.next().is_some() {
+            if self.dir_has_entries(inode.id) {
                 return Err(ENOTEMPTY);
             }
         }
 
         let dkey = Dentry::key(parent, name);
-        let kv = self.meta.begin().map_err(|_| EFAULT)?;
 
         if inode.kind != Itype::Dir && inode.links > 1 {
             inode.links -= 1;
@@ -372,9 +688,8 @@ impl Meta {
                 .duration_since(UNIX_EPOCH)
                 .expect("can't get unix timestamp")
                 .as_secs();
-            kv.upsert(Inode::key(inode.id), inode.val()).map_err(|_| EFAULT)?;
-            kv.del(dkey).map_err(|_| EFAULT)?;
-            kv.commit().map_err(|_| EFAULT)?;
+            self.stage_put(Inode::key(inode.id), inode.val());
+            self.stage_del(dkey);
             self.cache_put(inode, false);
             return Ok(inode);
         }
@@ -388,11 +703,10 @@ impl Meta {
             .ok_or(EFAULT)?;
         debug_assert_eq!(plan.ino, inode.id);
 
-        kv.del(Inode::key(inode.id)).map_err(|_| EFAULT)?;
-        kv.del(dkey).map_err(|_| EFAULT)?;
-        kv.upsert(InoMap::summary_key(), plan.summary_val()).map_err(|_| EFAULT)?;
-        kv.upsert(InoMap::group_key(plan.gid), plan.group_val()).map_err(|_| EFAULT)?;
-        kv.commit().map_err(|_| EFAULT)?;
+        self.stage_del(Inode::key(inode.id));
+        self.stage_del(dkey);
+        self.stage_put(InoMap::summary_key(), plan.summary_val());
+        self.stage_put(InoMap::group_key(plan.gid), plan.group_val());
 
         state.imap.apply_free(plan);
         drop(state);
@@ -431,10 +745,6 @@ impl Meta {
     }
 
     pub fn load_dentry(&self, ino: Ino, h: &mut DirHandle) {
-        let key = Dentry::prefix(ino);
-        let view = self.meta.view();
-        let iter = view.seek(&key);
-
         let self_inode = self.load_inode(ino).expect("can't load self inode");
 
         h.add(NameT {
@@ -448,23 +758,48 @@ impl Meta {
             ino: if ino == 1 { 1 } else { self_inode.parent },
         });
 
-        for item in iter {
-            if !item.key().starts_with(key.as_bytes()) {
-                break;
-            }
-            let de = bincode::deserialize::<Dentry>(item.val()).expect("can't deserialize dentry");
-            let inode = self.load_inode(de.ino).expect("can't load inode");
+        self.ensure_dir_index_loaded(ino);
+        let entries = {
+            let map = self.dir_index.lock().unwrap();
+            map.get(&ino).map(|idx| idx.entries.clone()).unwrap_or_default()
+        };
+        for (name, ino) in entries {
+            let inode = self.load_inode(ino).expect("can't load inode");
+            let key = Dentry::key(self_inode.id, &name);
+            self.dentry_cache_put(key, DentryCacheValue::Present(ino));
             h.add(NameT {
-                name: de.name,
+                name,
                 kind: inode.kind,
-                ino: de.ino,
+                ino,
             });
         }
     }
 
     pub fn dentry_exist(&self, ino: Ino, name: impl AsRef<str>) -> bool {
-        let name = Dentry::key(ino, name.as_ref());
-        self.meta.contains_key(&name).unwrap_or(false)
+        let n = name.as_ref();
+        let key = Dentry::key(ino, n);
+        match self.pending_get(&key) {
+            PendingValue::Put(_) => true,
+            PendingValue::Deleted => false,
+            PendingValue::Missing => match self.dentry_cache_get(&key) {
+                Some(DentryCacheValue::Present(_)) => true,
+                Some(DentryCacheValue::Absent) => false,
+                None => {
+                    self.ensure_dir_index_loaded(ino);
+                    match self.dir_index_lookup(ino, n) {
+                        Some(Some(ino)) => {
+                            self.dentry_cache_put(key, DentryCacheValue::Present(ino));
+                            true
+                        }
+                        Some(None) => {
+                            self.dentry_cache_put(key, DentryCacheValue::Absent);
+                            false
+                        }
+                        None => self.meta.contains_key(&key).unwrap_or(false),
+                    }
+                }
+            },
+        }
     }
 
     /// if `key` exist, we can overwrite it
@@ -472,23 +807,13 @@ impl Meta {
         let key = Dentry::key(parent, name.as_ref());
         log::info!("store_dentry {}", key);
         let de = Dentry::new(parent, ino, name.as_ref());
-        let r = self.meta.insert(&key, &de.val());
-        if r.is_err() {
-            log::error!("insert key {} vaule {} fail", key, ino);
-            return Err(r.err().unwrap().to_string());
-        }
+        self.stage_put(key, de.val());
         Ok(())
     }
 
     pub fn delete_key(&self, key: &String) -> Result<(), String> {
-        let r = self.meta.remove(key);
-        match r {
-            Err(e) => {
-                log::error!("can't remove {} error {:?}", key, e);
-                Err(format!("{:?}", e))
-            }
-            Ok(_) => Ok(()),
-        }
+        self.stage_del(key.clone());
+        Ok(())
     }
 
     pub fn rename(
@@ -506,11 +831,7 @@ impl Meta {
 
         if let Some(old_target_inode) = self.lookup(new_parent, new_name) {
             if old_target_inode.kind == Itype::Dir {
-                // check if empty
-                let prefix = Dentry::prefix(old_target_inode.id);
-                let view = self.meta.view();
-                let mut it = view.seek(&prefix);
-                if it.next().is_some() {
+                if self.dir_has_entries(old_target_inode.id) {
                     return Err(ENOTEMPTY);
                 }
             }
@@ -522,11 +843,8 @@ impl Meta {
         let new_dkey = Dentry::key(new_parent, new_name);
         let new_de = Dentry::new(new_parent, inode.id, new_name);
 
-        let kv = self.meta.begin().map_err(|_| EFAULT)?;
-        // store new dentry
-        kv.put(new_dkey, new_de.val()).map_err(|_| EFAULT)?;
-        // remove old dentry
-        kv.del(dkey).map_err(|_| EFAULT)?;
+        self.stage_put(new_dkey, new_de.val());
+        self.stage_del(dkey);
 
         if inode.kind == Itype::Dir && old_parent != new_parent {
             let mut inode = inode;
@@ -535,11 +853,10 @@ impl Meta {
                 .duration_since(UNIX_EPOCH)
                 .expect("can't get unix timestamp")
                 .as_secs();
-            kv.upsert(Inode::key(inode.id), inode.val()).map_err(|_| EFAULT)?;
+            self.stage_put(Inode::key(inode.id), inode.val());
             self.cache_put(inode, false);
         }
 
-        kv.commit().map_err(|_| EFAULT)?;
         Ok(())
     }
 
@@ -561,10 +878,8 @@ impl Meta {
 
         let dkey = Dentry::key(new_parent, new_name);
         let de = Dentry::new(new_parent, ino, new_name);
-        let kv = self.meta.begin().map_err(|_| EFAULT)?;
-        kv.upsert(Inode::key(ino), inode.val()).map_err(|_| EFAULT)?;
-        kv.put(dkey, de.val()).map_err(|_| EFAULT)?;
-        kv.commit().map_err(|_| EFAULT)?;
+        self.stage_put(Inode::key(ino), inode.val());
+        self.stage_put(dkey, de.val());
 
         self.cache_put(inode, false);
         Ok(inode)

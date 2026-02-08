@@ -29,7 +29,11 @@ impl FileHandle {
     }
 
     pub fn write(&mut self, off: u64, data: &[u8]) -> usize {
-        self.cache.lock().unwrap().write(off, data)
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(n) = cache.write_maybe_direct(off, data) {
+            return n;
+        }
+        cache.write(off, data)
     }
 
     pub fn flush(&mut self, sync: bool) {
@@ -47,7 +51,6 @@ impl FileHandle {
 
 impl Drop for FileHandle {
     fn drop(&mut self) {
-        log::info!("drop FileHandle ino {} fh {}", self.ino, self.fh);
     }
 }
 

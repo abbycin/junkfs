@@ -6,9 +6,10 @@ use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-const CACHE_LIMIT: usize = 1024; // cache limit in pages
+const CACHE_LIMIT: usize = 65536; // cache limit in pages
 const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
-const FLUSH_BYTES: usize = CACHE_LIMIT * FS_PAGE_SIZE as usize;
+const FLUSH_BYTES: usize = 64 << 20;
+const DIRECT_WRITE_MIN: usize = 256 << 10;
 
 pub struct CacheStore {
     ino: Ino,
@@ -36,41 +37,46 @@ impl CacheStore {
     /// `off` is global file offset, we need map to block_id and block offset
     /// NOTE: the data maybe cross blocks, we need split into two blocks
     pub fn write(&mut self, off: u64, data: &[u8]) -> usize {
-        assert!(data.len() <= FS_BLK_SIZE as usize);
-        let pos = off % FS_BLK_SIZE;
-        let blk = off / FS_BLK_SIZE;
-        let rest_bytes = FS_BLK_SIZE - pos;
-        let len = data.len() as u64;
         let mut nbytes = 0;
-
-        // require two blocks
-        if len > rest_bytes {
-            let data1 = &data[0..rest_bytes as usize];
-            let blk1 = blk;
-            let blk_off1 = pos;
-            let off1 = off;
-            let n = self.write_block(blk1, blk_off1, off1, data1);
-            if n != data1.len() {
-                nbytes += n;
-                return nbytes;
+        if data.is_empty() {
+            return nbytes;
+        }
+        let mut cur_off = off;
+        let mut rest = data;
+        while !rest.is_empty() {
+            let pos = cur_off % FS_BLK_SIZE;
+            let blk = cur_off / FS_BLK_SIZE;
+            let rest_bytes = FS_BLK_SIZE - pos;
+            let len = min(rest.len(), rest_bytes as usize);
+            let n = self.write_block(blk, pos, cur_off, &rest[..len]);
+            nbytes += n;
+            if n < len {
+                break;
             }
-
-            let data2 = &data[rest_bytes as usize..];
-            let blk2 = blk1 + 1;
-            let blk_off2 = 0;
-            let off2 = blk2 * FS_BLK_SIZE;
-            assert_eq!(blk_off2 * FS_BLK_SIZE % FS_BLK_SIZE, off2);
-            let n = self.write_block(blk2, blk_off2, off2, data2);
-            if n != data2.len() {
-                nbytes += n;
-                return nbytes;
-            }
-        } else {
-            nbytes += self.write_block(blk, pos, off, data);
+            cur_off += len as u64;
+            rest = &rest[len..];
         }
         record_write(nbytes);
         self.last_write = Instant::now();
         nbytes
+    }
+
+    pub fn write_maybe_direct(&mut self, off: u64, data: &[u8]) -> Option<usize> {
+        if !Self::direct_candidate(off, data.len()) {
+            return None;
+        }
+        if !self.bufs.is_empty() {
+            if self.flush(false).is_err() {
+                return None;
+            }
+        }
+        match FileStore::write_at(self.ino, off, data, false) {
+            Ok(n) => {
+                self.last_write = Instant::now();
+                Some(n)
+            }
+            Err(_) => None,
+        }
     }
 
     pub fn read(&self, off: u64, size: usize) -> Option<Vec<u8>> {
@@ -143,6 +149,16 @@ impl CacheStore {
     pub fn flush(&mut self, sync: bool) -> Result<(), String> {
         let bufs = self.take_entries();
         Self::flush_entries(self.ino, bufs, sync)
+    }
+
+    fn direct_candidate(off: u64, len: usize) -> bool {
+        if len < DIRECT_WRITE_MIN {
+            return false;
+        }
+        if off % FS_PAGE_SIZE != 0 {
+            return false;
+        }
+        (len as u64) % FS_PAGE_SIZE == 0
     }
 
     fn copy_data(&mut self, src: *const u8, dst: *mut u8, size: usize, blk_id: u64, blk_off: u64, off: u64) {

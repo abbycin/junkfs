@@ -4,6 +4,7 @@ mod filestore;
 mod stats;
 #[cfg(not(feature = "stats"))]
 mod stats {
+    #[allow(dead_code)]
     #[derive(Clone, Copy)]
     pub(crate) struct StatsSnapshot {
         pub write_calls: u64,
@@ -24,6 +25,7 @@ mod stats {
 
     pub(crate) fn record_pwritev(_: u64, _: u64) {}
 
+    #[allow(dead_code)]
     pub(crate) fn snapshot() -> StatsSnapshot {
         StatsSnapshot {
             write_calls: 0,
@@ -42,7 +44,12 @@ mod stats {
 
 pub use cache_store::CacheStore;
 pub use filestore::FileStore;
-pub(crate) use stats::{record_flush, record_pwritev, record_write, snapshot, StatsSnapshot};
+pub(crate) use stats::{record_flush, record_pwritev, record_write};
+pub(crate) type StatsSnapshot = stats::StatsSnapshot;
+#[allow(dead_code)]
+pub(crate) fn snapshot() -> StatsSnapshot {
+    stats::snapshot()
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]

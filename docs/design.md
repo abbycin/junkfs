@@ -14,14 +14,26 @@
 #### SuperBlock
 
 由于使用了`kvdb`在`superblock`中可以将`dentry`剥离出来，由于`dentry`是一种特殊的文件，因此也会占有`inode`
-，因此在`superblock`中只保持`inode`空闲管理的`bitmap`，同时存储数据存储路径，`superblock`结构如下
+，因此在`superblock`中只保留基础参数与数据存储路径，`inode`空闲管理采用**分组位图**，单独存放在`kvdb`中，
+以降低写放大与读放大。`superblock`结构如下
 
 ```rust
 struct SuperBlock {
-    store_path: String,
-    imap: BitMap,
+    ino: Ino,
+    uri: String,
+    version: u32,
+    total_inodes: u64,
+    group_size: u64,
+    group_count: u64,
 }
 ```
+
+`inode`分配位图由两个层次构成：
+
+- `imap_sum`：每个 group 一个 bit，表示该组是否还有空闲 inode
+- `imap_$gid`：每个 group 内的具体位图，按需加载
+
+这样可以避免每次分配/释放都修改整个大位图。
 
 #### Dentry
 
@@ -83,18 +95,16 @@ NOTE: 最好使用 XFS 这类动态分配 inode 的文件系统做数据存储
 
 #### 数据一致性与 fsync 语义
 
-为保证崩溃一致性，数据与元数据更新遵循以下顺序：
-
-1. 先写数据文件，并 `sync_all`，确保持久化
-2. 再更新 inode 等元数据（通过事务提交）
-3. 创建/删除数据文件后对父目录 `fsync`
-4. 数据根目录与分片目录按需创建，并在创建后对父目录 `fsync`
+`junkfs`采用**写回(writeback)**策略：数据与元数据会先进入内存缓存，由后台线程周期性刷盘并批量提交元数据。
+因此在**没有显式 fsync** 的情况下，崩溃一致性弱于传统的严格同步方案，但性能更高。
 
 `fsync` 语义区分如下：
 
-- `fsync(datasync=true)`：仅同步数据文件（`sync_data`）
-- `fsync(datasync=false)`：同步数据文件（`sync_all`）+ 元数据（`meta.sync()`）
+- `fsync(datasync=true)`：先刷数据缓存，再 `sync_data`，随后写回该 inode 元数据并提交 pending 事务
+- `fsync(datasync=false)`：先刷数据缓存，再 `sync_all`，随后 `meta.sync()`（写回 inode/imap/sb 并提交 pending）
 - `fsyncdir`：仅同步元数据（`meta.sync()`）
+
+为了降低开销，**数据文件创建/删除不再对父目录 `fsync`**，这一点偏向性能而非强一致语义。
 
 #### 文件抽象
 
@@ -116,17 +126,25 @@ NOTE: 最好使用 XFS 这类动态分配 inode 的文件系统做数据存储
 
 ##### 元数据缓存
 
-~~元数据缓存包括`dentry`和`inode`采用`LRU`淘汰算法，设计上是支持`write back`的，但在实现上确实`write through`，对于`ls`
-这种极度常用的命令，如果采用`write back`模式，每次都需要从`kvdb`读取`dentry`后再和缓存对比去重取新，实现稍显复杂，因此元数据缓存仅作为读缓存使用~~
+当前实现包含轻量级元数据缓存与索引：
 
-已删除，使用数据库自带的缓存即可
+- `inode`缓存：读缓存 + dirty 标记，写回由后台线程或 `fsync` 触发
+- `dentry` LRU：缓存目录项存在性与 inode 号，减少 `kvdb` 读取
+- `dir_index`：按目录维护 `name -> ino` 的哈希索引，首次 `readdir/lookup` 时从 `kvdb` 扫描构建，并与 pending 变更合并
+
+这套缓存不会改变持久化语义，只是减少查询路径上的随机读。
 
 ##### 数据缓存
 
-数据缓存使用固定大小的页面组成，在设计上，当缓存不足时将缓存刷到文件中，或在刷写超时后刷到文件。同样在实现中每当文件关闭时或读取前都会将缓存刷到文件中，原因是`junkfs`
-没有定时任务支持，同时对于同一个文件描述符写后读场景有限，结果就是数据缓存显得很鸡肋。如果后续后续有了定时任务支持，那么就可以实现写数据到缓存后立即返回，提高写性能。在`Rust`
-中实现还是有点困难，尤其是`fuser`这个`crate`本身不支持`async`这一套（[这里](https://github.com/jmpq/async-fuse-rs)
-倒是有个异步实现），如果使用额外线程来实现，那数据和代码结构将会非常复杂
+数据缓存使用固定大小的页面组成，在设计上，当缓存不足时将缓存刷到文件中，或在刷写超时后刷到文件。当前实现不再要求在 `close/read` 前强制刷盘，而是由后台线程周期性写回。
+当前实现已引入**后台写回线程**，以实现周期性 flush：
+
+- 数据写入先进入 `CacheStore`（`MemPool` 页缓存），写回条件：缓存超过阈值或超时
+- 后台线程定期 flush 缓存，并批量提交元数据
+- 对于**大块且对齐的写入**，会走直接写路径（pwrite），绕过缓存，降低拷贝与页管理开销
+- FUSE 挂载启用 `writeback_cache` 与 `async`，并在 `init` 中将 `max_write` 提升到 16MB
+
+因此数据缓存不再是纯“写穿”策略，而是典型的 writeback 模式。
 
 ### 元数据引擎
 
@@ -134,4 +152,7 @@ NOTE: 最好使用 XFS 这类动态分配 inode 的文件系统做数据存储
 trait即可替换掉`sled`，存储引擎只需要提供`key-value`接口即可，比如存储引擎为关系式数据库，那么对于`ls`
 命令，可能的操作是 `select * from dentry_table where dentry_name like 'd_233_%'`~~
 
-目前已经改为使用 `mace` 作为元数据引擎，并且不考虑扩展。所有元数据存放在固定 bucket 中，`mknod/unlink/rename/link` 等操作通过单事务提交，确保多 key 更新的原子性
+目前已经改为使用 `mace` 作为元数据引擎，并且不考虑扩展。所有元数据存放在固定 bucket 中，
+`mknod/unlink/rename/link` 等操作会**先写入 pending 缓冲**，再由后台线程或 `fsync` 批量提交。
+`commit_pending` 内部使用单事务提交多个 key，确保这批更新的原子性。后台线程按**阈值或时间间隔**
+提交（默认阈值约 8K key、间隔 200ms），以减少事务开销。
