@@ -318,20 +318,34 @@ impl FileStore {
 
     pub fn read_at(ino: Ino, off: u64, size: usize) -> Option<Vec<u8>> {
         let key = Self::file_key(ino);
-        let sz = min(FS_FUSE_MAX_IO_SIZE, size as u64) as usize;
-
+        if size == 0 {
+            return Some(Vec::new());
+        }
         Self::get_fp_and_then(key, ino, false, |fp| {
-            let mut v = vec![0u8; sz];
-            match fp.read_at(&mut v, off) {
-                Ok(n) => {
-                    v.truncate(n);
-                    Some(v)
-                }
-                Err(e) => {
-                    log::error!("can't read data ino {} off {} size {} error {}", ino, off, sz, e);
-                    None
+            let mut out = Vec::with_capacity(size);
+            let mut offset = off;
+            let mut remain = size;
+            while remain > 0 {
+                let chunk = min(FS_FUSE_MAX_IO_SIZE, remain as u64) as usize;
+                let mut v = vec![0u8; chunk];
+                match fp.read_at(&mut v, offset) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        v.truncate(n);
+                        out.extend_from_slice(&v);
+                        offset += n as u64;
+                        remain -= n;
+                        if n < chunk {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("can't read data ino {} off {} size {} error {}", ino, offset, chunk, e);
+                        return None;
+                    }
                 }
             }
+            Some(out)
         })
         .flatten()
     }
