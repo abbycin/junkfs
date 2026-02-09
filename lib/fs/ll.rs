@@ -83,12 +83,7 @@ pub extern "C" fn junkfs_ll_init(userdata: *mut c_void, conn: *mut fuse::fuse_co
 
 #[no_mangle]
 pub extern "C" fn junkfs_ll_destroy(userdata: *mut c_void) {
-    if userdata.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(userdata as *mut Fs));
-    }
+    let _ = userdata;
 }
 
 #[no_mangle]

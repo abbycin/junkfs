@@ -73,6 +73,8 @@ struct DirIndex {
 }
 
 const DENTRY_CACHE_CAP: usize = 1 << 18;
+const PENDING_COMMIT_BATCH: usize = 4096;
+const PENDING_COMMIT_BYTES: usize = 4 << 20;
 
 impl Meta {
     // write superblock
@@ -340,38 +342,85 @@ impl Meta {
     }
 
     pub fn commit_pending(&self) -> Result<(), String> {
-        let (puts, dels) = {
-            let pending = self.pending.lock().unwrap();
-            if pending.puts.is_empty() && pending.dels.is_empty() {
+        self.commit_pending_inner().map_err(|e| e.to_string())
+    }
+
+    fn commit_pending_inner(&self) -> Result<(), OpCode> {
+        let mut batch_limit = PENDING_COMMIT_BATCH;
+        loop {
+            let (puts, dels) = {
+                let pending = self.pending.lock().unwrap();
+                if pending.puts.is_empty() && pending.dels.is_empty() {
+                    return Ok(());
+                }
+                let mut puts = Vec::new();
+                let mut bytes = 0usize;
+                for (k, v) in pending.puts.iter().take(batch_limit) {
+                    let add = k.len() + v.len();
+                    if !puts.is_empty() && bytes + add > PENDING_COMMIT_BYTES {
+                        break;
+                    }
+                    bytes += add;
+                    puts.push((k.clone(), v.clone()));
+                }
+                let mut dels = Vec::new();
+                let remain = batch_limit.saturating_sub(puts.len());
+                if remain > 0 {
+                    for k in pending.dels.iter().take(remain) {
+                        if !puts.is_empty() && bytes + k.len() > PENDING_COMMIT_BYTES {
+                            break;
+                        }
+                        bytes += k.len();
+                        dels.push(k.clone());
+                    }
+                }
+                (puts, dels)
+            };
+            if puts.is_empty() && dels.is_empty() {
                 return Ok(());
             }
-            (
-                pending.puts.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
-                pending.dels.iter().cloned().collect::<Vec<_>>(),
-            )
-        };
-        let kv = self.meta.begin().map_err(|e| e.to_string())?;
-        for (k, v) in &puts {
-            kv.upsert(k, v).map_err(|e| e.to_string())?;
+            let res = self.commit_pending_batch(&puts, &dels);
+            match res {
+                Ok(()) => {
+                    let mut pending = self.pending.lock().unwrap();
+                    for (k, v) in puts {
+                        if let Some(cur) = pending.puts.get(&k) {
+                            if *cur == v {
+                                pending.puts.remove(&k);
+                            }
+                        }
+                    }
+                    for k in dels {
+                        if pending.dels.contains(&k) && !pending.puts.contains_key(&k) {
+                            pending.dels.remove(&k);
+                        }
+                    }
+                    batch_limit = PENDING_COMMIT_BATCH;
+                }
+                Err(OpCode::AbortTx) => {
+                    if batch_limit <= 1 {
+                        return Err(OpCode::AbortTx);
+                    }
+                    batch_limit = (batch_limit / 2).max(1);
+                }
+                Err(e) => return Err(e),
+            }
         }
-        for k in &dels {
-            kv.del(k).map_err(|e| e.to_string())?;
-        }
-        kv.commit().map_err(|e| e.to_string())?;
-        let mut pending = self.pending.lock().unwrap();
+    }
+
+    fn commit_pending_batch(&self, puts: &[(String, Vec<u8>)], dels: &[String]) -> Result<(), OpCode> {
+        let kv = self.meta.begin()?;
         for (k, v) in puts {
-            if let Some(cur) = pending.puts.get(&k) {
-                if *cur == v {
-                    pending.puts.remove(&k);
+            kv.upsert(k, v)?;
+        }
+        for k in dels {
+            if let Err(e) = kv.del(k) {
+                if e != OpCode::NotFound {
+                    return Err(e);
                 }
             }
         }
-        for k in dels {
-            if pending.dels.contains(&k) && !pending.puts.contains_key(&k) {
-                pending.dels.remove(&k);
-            }
-        }
-        Ok(())
+        kv.commit()
     }
 
     pub fn pending_len(&self) -> usize {

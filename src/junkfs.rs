@@ -32,6 +32,7 @@ fn main() {
         }
     };
 
+    let mut fs = Box::new(fs);
     let mut args = fuse::fuse_args {
         argc: 0,
         argv: ptr::null_mut(),
@@ -47,12 +48,12 @@ fn main() {
         fuse::fuse_opt_add_arg(&mut args, opt_val.as_ptr());
     }
 
-    let fs_ptr = Box::into_raw(Box::new(fs)) as *mut c_void;
+    let fs_ptr = fs.as_mut() as *mut Fs as *mut c_void;
     let se = unsafe { fuse::junkfs_fuse_session_new(&mut args, fs_ptr) };
     if se.is_null() {
-        unsafe { drop(Box::from_raw(fs_ptr as *mut Fs)) };
         eprintln!("fuse_session_new failed");
         unsafe { fuse::fuse_opt_free_args(&mut args) };
+        fs.shutdown();
         std::process::exit(1);
     }
 
@@ -64,6 +65,7 @@ fn main() {
             fuse::fuse_opt_free_args(&mut args);
         }
         eprintln!("fuse_session_mount failed");
+        fs.shutdown();
         std::process::exit(1);
     }
 
@@ -83,4 +85,7 @@ fn main() {
     if loop_res != 0 {
         log::error!("fuse loop exit with {}", loop_res);
     }
+
+    fs.shutdown();
+    drop(fs);
 }

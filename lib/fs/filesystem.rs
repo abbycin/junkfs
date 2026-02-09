@@ -69,7 +69,9 @@ impl Writeback {
                 let _ = meta.flush_dirty_inodes();
                 let pending = meta.pending_len();
                 if pending >= META_COMMIT_THRESHOLD || last_commit.elapsed() >= Duration::from_millis(META_COMMIT_INTERVAL_MS) {
-                    let _ = meta.commit_pending();
+                    if let Err(e) = meta.commit_pending() {
+                        log::error!("commit pending error {}", e);
+                    }
                     last_commit = Instant::now();
                 }
                 #[cfg(feature = "stats")]
@@ -117,6 +119,7 @@ pub struct Fs {
     inode_refs: Vec<Mutex<HashMap<Ino, usize>>>,
     hmap: Mutex<BitMap>,
     writeback: Mutex<Writeback>,
+    shutdown: AtomicBool,
 }
 
 impl Fs {
@@ -143,6 +146,7 @@ impl Fs {
             inode_refs,
             hmap: Mutex::new(BitMap::new(10240)), // More handles for complex builds
             writeback: Mutex::new(writeback),
+            shutdown: AtomicBool::new(false),
         })
     }
 
@@ -294,10 +298,15 @@ impl Fs {
             }
         }
     }
-}
 
-impl Drop for Fs {
-    fn drop(&mut self) {
+    pub fn shutdown(&self) {
+        if self.shutdown.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let pending_before = self.meta.pending_len();
+        if pending_before > 0 {
+            log::info!("shutdown pending before {}", pending_before);
+        }
         if let Ok(mut w) = self.writeback.lock() {
             w.stop();
         }
@@ -313,9 +322,15 @@ impl Drop for Fs {
                 let bufs = c.take_entries();
                 (ino, bufs)
             };
-        let _ = CacheStore::flush_entries(ino, bufs, true);
+            let _ = CacheStore::flush_entries(ino, bufs, true);
         }
-        let _ = self.meta.sync();
+        if let Err(e) = self.meta.sync() {
+            log::error!("sync metadata on drop error {}", e);
+        }
+        let pending_after = self.meta.pending_len();
+        if pending_after > 0 {
+            log::error!("shutdown pending after {}", pending_after);
+        }
         self.meta.close();
         #[cfg(feature = "stats")]
         {
@@ -335,5 +350,11 @@ impl Drop for Fs {
             );
         }
         MemPool::destroy();
+    }
+}
+
+impl Drop for Fs {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
