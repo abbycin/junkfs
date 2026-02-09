@@ -1,0 +1,13 @@
+[package]
+name = "junkfs-fuse"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "junkfs_fuse"
+path = "src/lib.rs"
+
+[build-dependencies]
+bindgen = "0.69.4"
+cc = "1.0"
+pkg-config = "0.3"

@@ -22,6 +22,8 @@ supported operations:
 
 ## How to use
 
+This project now uses **libfuse3 low-level C API** with a multi-threaded session loop.
+
 format
 
 ```bash

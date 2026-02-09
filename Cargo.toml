@@ -24,7 +24,7 @@ stats = []
 [dependencies]
 bincode = "1.3.3"
 chrono = "0.4.38"
-fuser = "0.14.0"
+junkfs-fuse = { path = "fuse" }
 libc = "0.2.155"
 log = "0.4.21"
 mace-kv = "0.0.26"

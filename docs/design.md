@@ -1,4 +1,4 @@
-这是一个`Rust`和`FUSE`的练习项目，目前已实现数个常用的`POSIX`文件操作方法，这里介绍`junkfs`的设计
+这是一个`Rust`和`FUSE`的练习项目，目前基于`libfuse3`低层`C API`实现多线程挂载，并实现数个常用的`POSIX`文件操作方法，这里介绍`junkfs`的设计
 
 ### 元数据设计
 
@@ -128,7 +128,7 @@ NOTE: 最好使用 XFS 这类动态分配 inode 的文件系统做数据存储
 
 当前实现包含轻量级元数据缓存与索引：
 
-- `inode`缓存：读缓存 + dirty 标记，写回由后台线程或 `fsync` 触发
+- `inode`缓存：读缓存 + dirty 标记，写回由后台线程或 `fsync` 触发，dirty inode 通过集合追踪以避免全表扫描
 - `dentry` LRU：缓存目录项存在性与 inode 号，减少 `kvdb` 读取
 - `dir_index`：按目录维护 `name -> ino` 的哈希索引，首次 `readdir/lookup` 时从 `kvdb` 扫描构建，并与 pending 变更合并
 
@@ -142,9 +142,18 @@ NOTE: 最好使用 XFS 这类动态分配 inode 的文件系统做数据存储
 - 数据写入先进入 `CacheStore`（`MemPool` 页缓存），写回条件：缓存超过阈值或超时
 - 后台线程定期 flush 缓存，并批量提交元数据
 - 对于**大块且对齐的写入**，会走直接写路径（pwrite），绕过缓存，降低拷贝与页管理开销
-- FUSE 挂载启用 `writeback_cache` 与 `async`，并在 `init` 中将 `max_write` 提升到 16MB
+- FUSE 挂载启用 `writeback_cache` 与 `async_read`，并在 `init` 中将 `max_write/max_read/max_readahead` 提升到 16MB
 
 因此数据缓存不再是纯“写穿”策略，而是典型的 writeback 模式。
+
+### FUSE 接入
+
+当前使用 `libfuse3` 低层 `C API`：
+
+- `fuse_session_loop_mt` 多线程模型
+- `max_write/max_read/max_readahead = 16MB`
+- 启用 `writeback_cache` 与 `async_read`
+- `lookup` miss 使用负向 entry 缓存，按 `entry_timeout` 做短期缓存
 
 ### 元数据引擎
 
@@ -155,4 +164,4 @@ trait即可替换掉`sled`，存储引擎只需要提供`key-value`接口即可�
 目前已经改为使用 `mace` 作为元数据引擎，并且不考虑扩展。所有元数据存放在固定 bucket 中，
 `mknod/unlink/rename/link` 等操作会**先写入 pending 缓冲**，再由后台线程或 `fsync` 批量提交。
 `commit_pending` 内部使用单事务提交多个 key，确保这批更新的原子性。后台线程按**阈值或时间间隔**
-提交（默认阈值约 8K key、间隔 200ms），以减少事务开销。
+提交（默认阈值约 8K key、间隔 200ms），以减少事务开销。dirty inode 采用集合追踪，仅写回需要的 inode。

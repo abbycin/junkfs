@@ -35,6 +35,7 @@ pub struct Meta {
     pub meta: MaceStore,
     state: Mutex<MetaState>,
     inode_cache: RwLock<HashMap<Ino, InodeCache>>,
+    dirty_inodes: Mutex<HashSet<Ino>>,
     pending: Mutex<Pending>,
     dentry_cache: Mutex<LRUCache<String, DentryCacheValue>>,
     dir_index: Mutex<HashMap<Ino, DirIndex>>,
@@ -148,6 +149,7 @@ impl Meta {
                             meta,
                             state: Mutex::new(state),
                             inode_cache: RwLock::new(HashMap::new()),
+                            dirty_inodes: Mutex::new(HashSet::new()),
                             pending: Mutex::new(Pending::new()),
                             dentry_cache: Mutex::new(LRUCache::new(DENTRY_CACHE_CAP)),
                             dir_index: Mutex::new(HashMap::new()),
@@ -454,6 +456,9 @@ impl Meta {
                 dirty,
             },
         );
+        if dirty {
+            self.dirty_inodes.lock().unwrap().insert(inode.id);
+        }
     }
 
     fn cache_mark_dirty(&self, inode: Inode) {
@@ -473,11 +478,13 @@ impl Meta {
                 );
             }
         }
+        self.dirty_inodes.lock().unwrap().insert(inode.id);
     }
 
     fn cache_remove(&self, ino: Ino) {
         let mut cache = self.inode_cache.write().unwrap();
         cache.remove(&ino);
+        self.dirty_inodes.lock().unwrap().remove(&ino);
     }
 
     pub fn update_inode_after_write(&self, ino: Ino, end_off: u64) -> Result<(), String> {
@@ -499,22 +506,47 @@ impl Meta {
     }
 
     pub fn flush_dirty_inodes(&self) -> Result<(), String> {
-        let dirty = {
-            let cache = self.inode_cache.read().unwrap();
-            cache.values().filter(|e| e.dirty).map(|e| e.inode).collect::<Vec<_>>()
+        let dirty_set = {
+            let mut set = self.dirty_inodes.lock().unwrap();
+            if set.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut *set)
         };
+        let mut dirty = Vec::new();
+        {
+            let cache = self.inode_cache.read().unwrap();
+            for ino in dirty_set {
+                if let Some(e) = cache.get(&ino) {
+                    if e.dirty {
+                        dirty.push((ino, e.inode));
+                    }
+                }
+            }
+        }
         if dirty.is_empty() {
             return Ok(());
         }
-        for inode in &dirty {
+        for (_, inode) in &dirty {
             self.stage_put(Inode::key(inode.id), inode.val());
         }
-        let mut cache = self.inode_cache.write().unwrap();
-        for inode in dirty {
-            if let Some(e) = cache.get_mut(&inode.id) {
-                if e.inode == inode {
-                    e.dirty = false;
+        let mut keep = Vec::new();
+        {
+            let mut cache = self.inode_cache.write().unwrap();
+            for (ino, inode) in dirty {
+                if let Some(e) = cache.get_mut(&ino) {
+                    if e.dirty && e.inode == inode {
+                        e.dirty = false;
+                    } else if e.dirty {
+                        keep.push(ino);
+                    }
                 }
+            }
+        }
+        if !keep.is_empty() {
+            let mut set = self.dirty_inodes.lock().unwrap();
+            for ino in keep {
+                set.insert(ino);
             }
         }
         Ok(())
@@ -601,11 +633,7 @@ impl Meta {
                             self.dentry_cache_put(key, DentryCacheValue::Present(ino));
                             self.load_inode(ino)
                         }
-                        Some(None) => {
-                            self.dentry_cache_put(key, DentryCacheValue::Absent);
-                            None
-                        }
-                        None => match self.meta.get_optional(&key) {
+                        Some(None) | None => match self.meta.get_optional(&key) {
                             Ok(Some(dentry)) => {
                                 let dentry = bincode::deserialize::<Dentry>(&dentry).expect("can't deserialize dentry");
                                 self.dentry_cache_put(key, DentryCacheValue::Present(dentry.ino));
@@ -720,12 +748,8 @@ impl Meta {
             return Some(i);
         }
         let key = Inode::key(inode);
-        match self.meta.get(&key) {
-            Err(e) => {
-                log::error!("load inode error {}", e);
-                None
-            }
-            Ok(tmp) => {
+        match self.meta.get_optional(&key) {
+            Ok(Some(tmp)) => {
                 let inode = bincode::deserialize::<Inode>(&tmp);
                 if inode.is_err() {
                     log::error!("deserialize inode fail error {}", inode.err().unwrap());
@@ -734,6 +758,11 @@ impl Meta {
                 let inode = inode.unwrap();
                 self.cache_put(inode, false);
                 Some(inode)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log::error!("load inode error {}", e);
+                None
             }
         }
     }
@@ -791,11 +820,7 @@ impl Meta {
                             self.dentry_cache_put(key, DentryCacheValue::Present(ino));
                             true
                         }
-                        Some(None) => {
-                            self.dentry_cache_put(key, DentryCacheValue::Absent);
-                            false
-                        }
-                        None => self.meta.contains_key(&key).unwrap_or(false),
+                        Some(None) | None => self.meta.contains_key(&key).unwrap_or(false),
                     }
                 }
             },

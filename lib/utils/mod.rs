@@ -1,13 +1,9 @@
 mod bitmap;
 mod bitmap64;
 
-use crate::meta::{Inode, Itype};
 pub use bitmap::BitMap;
 pub use bitmap64::BitMap64;
-use fuser::{FileAttr, FileType};
 use once_cell::sync::Lazy;
-use std::time;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CHUNK_SIZE: u64 = 1 << 26;
 pub const BLOCK_SIZE: u64 = 1 << 22;
@@ -38,37 +34,4 @@ pub fn init_data_path(mp: &str) {
 #[allow(static_mut_refs)]
 pub fn get_data_path() -> &'static String {
     unsafe { &DATA_PATH }
-}
-
-pub fn to_systime(s: u64) -> SystemTime {
-    UNIX_EPOCH + time::Duration::from_secs(s)
-}
-
-pub fn to_filetype(s: Itype) -> FileType {
-    match s {
-        Itype::File => FileType::RegularFile,
-        Itype::Dir => FileType::Directory,
-        Itype::Symlink => FileType::Symlink,
-    }
-}
-
-pub fn to_attr(inode: &Inode) -> FileAttr {
-    FileAttr {
-        ino: inode.id,
-        size: inode.length,
-        blocks: inode.blocks(),
-        atime: to_systime(inode.atime),
-        mtime: to_systime(inode.mtime),
-        ctime: to_systime(inode.ctime),
-        kind: to_filetype(inode.kind),
-        perm: (inode.mode & 0o7777),
-        nlink: inode.links,
-        uid: inode.uid,
-        gid: inode.gid,
-        blksize: FS_BLK_SIZE as u32,
-        // the following is unused
-        rdev: 0,
-        crtime: time::SystemTime::now(),
-        flags: 0,
-    }
 }
