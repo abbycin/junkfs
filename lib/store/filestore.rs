@@ -14,6 +14,11 @@ const MAX_CACHE_ITEMS: usize = 256;
 const DATA_SHARD_BITS: u64 = 8;
 const DATA_SHARD_MASK: u64 = (1 << DATA_SHARD_BITS) - 1;
 const DATA_SHARD_GROUP_SIZE: u64 = 4096;
+static VERIFY_FLUSH: Lazy<bool> = Lazy::new(|| {
+    std::env::var("JUNK_VERIFY_FLUSH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+});
 
 struct FileFlusher;
 
@@ -43,6 +48,109 @@ impl Flusher<u64, std::fs::File> for FileStore {
 }
 
 impl FileStore {
+    fn verify_flush_enabled() -> bool {
+        *VERIFY_FLUSH
+    }
+
+    fn range_overlaps(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+        a_start < b_end && b_start < a_end
+    }
+
+    fn verify_entries(ino: Ino, buf: &[Entry]) {
+        if !Self::verify_flush_enabled() || buf.is_empty() {
+            return;
+        }
+        let key = Self::file_key(ino);
+        let _ = Self::get_fp_and_then(key, ino, false, |fp| {
+            let mut covered: Vec<(u64, u64)> = Vec::new();
+            let mut verified = 0usize;
+            for entry in buf.iter().rev() {
+                if verified >= 16 {
+                    break;
+                }
+                if entry.size == 0 {
+                    continue;
+                }
+                let start = entry.off;
+                let end = start.saturating_add(entry.size);
+                if covered
+                    .iter()
+                    .any(|(cs, ce)| Self::range_overlaps(start, end, *cs, *ce))
+                {
+                    continue;
+                }
+                let len = entry.size as usize;
+                let mut disk = vec![0u8; len];
+                match fp.read_at(&mut disk, entry.off) {
+                    Ok(n) if n == len => {}
+                    Ok(n) => {
+                        log::error!(
+                            "verify flush short read ino {} off {} expect {} got {}",
+                            ino,
+                            entry.off,
+                            len,
+                            n
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "verify flush read fail ino {} off {} size {} err {}",
+                            ino,
+                            entry.off,
+                            len,
+                            e
+                        );
+                        return;
+                    }
+                }
+                let mem = unsafe { std::slice::from_raw_parts(entry.data as *const u8, len) };
+                if mem != disk.as_slice() {
+                    log::error!("verify flush mismatch ino {} off {} size {}", ino, entry.off, len);
+                    return;
+                }
+                covered.push((start, end));
+                verified += 1;
+            }
+        });
+    }
+
+    fn verify_write_at(ino: Ino, off: u64, data: &[u8]) {
+        if !Self::verify_flush_enabled() || data.is_empty() {
+            return;
+        }
+        let key = Self::file_key(ino);
+        let _ = Self::get_fp_and_then(key, ino, false, |fp| {
+            let mut disk = vec![0u8; data.len()];
+            match fp.read_at(&mut disk, off) {
+                Ok(n) if n == data.len() => {}
+                Ok(n) => {
+                    log::error!(
+                        "verify write_at short read ino {} off {} expect {} got {}",
+                        ino,
+                        off,
+                        data.len(),
+                        n
+                    );
+                    return;
+                }
+                Err(e) => {
+                    log::error!(
+                        "verify write_at read fail ino {} off {} size {} err {}",
+                        ino,
+                        off,
+                        data.len(),
+                        e
+                    );
+                    return;
+                }
+            }
+            if disk.as_slice() != data {
+                log::error!("verify write_at mismatch ino {} off {} size {}", ino, off, data.len());
+            }
+        });
+    }
+
     fn file_key(ino: Ino) -> String {
         format!("i{}", ino)
     }
@@ -126,9 +234,7 @@ impl FileStore {
             .create_new(true)
             .open(&fpath)
         {
-            Ok(fp) => {
-                Some(fp)
-            }
+            Ok(fp) => Some(fp),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 match std::fs::File::options().read(true).write(true).open(&fpath) {
                     Ok(fp) => Some(fp),
@@ -187,8 +293,16 @@ impl FileStore {
         match res {
             Some(Ok(())) => Ok(()),
             Some(Err(e)) => Err(e),
-            None => Err("can't open data file".to_string()),
+            None => {
+                log::error!("can't open data file for set_len ino {}", ino);
+                Err("can't open data file".to_string())
+            }
         }
+    }
+
+    pub fn exists(ino: Ino) -> bool {
+        let path = Self::build_path(ino);
+        Path::new(&path).exists()
     }
 
     pub fn fsync(ino: Ino, datasync: bool) -> Result<(), String> {
@@ -264,6 +378,7 @@ impl FileStore {
         let res = Self::get_fp_and_then(key, ino, true, |fp| Self::write_entries_inner(fp, buf));
         match res {
             Some(Ok(())) => {
+                Self::verify_entries(ino, buf);
                 if sync && !Self::sync_file(ino, true) {
                     return Err("can't sync file".to_string());
                 }
@@ -306,6 +421,7 @@ impl FileStore {
         let res = Self::get_fp_and_then(key, ino, true, |fp| Self::write_at_inner(fp, off, data));
         match res {
             Some(Ok(n)) => {
+                Self::verify_write_at(ino, off, data);
                 if sync && !Self::sync_file(ino, true) {
                     return Err("can't sync file".to_string());
                 }

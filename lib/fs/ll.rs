@@ -77,7 +77,12 @@ pub extern "C" fn junkfs_ll_init(userdata: *mut c_void, conn: *mut fuse::fuse_co
         (*conn).max_read = 16 << 20;
         (*conn).max_readahead = 16 << 20;
         (*conn).want |= fuse::FUSE_CAP_ASYNC_READ as u32;
-        (*conn).want |= fuse::FUSE_CAP_WRITEBACK_CACHE as u32;
+        let disable_wbc = std::env::var("JUNK_DISABLE_WBC")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !disable_wbc {
+            (*conn).want |= fuse::FUSE_CAP_WRITEBACK_CACHE as u32;
+        }
     }
 }
 
@@ -200,6 +205,15 @@ pub extern "C" fn junkfs_ll_mknod(
     let fs = unsafe { fs_from_req(req) };
     match fs.meta().mknod(parent as u64, &name, Itype::File, mode as u32) {
         Ok(inode) => {
+            let existed = FileStore::exists(inode.id);
+            if existed {
+                log::error!("mknod reused data file ino {}", inode.id);
+            }
+            if let Err(e) = FileStore::set_len(inode.id, 0) {
+                log::error!("mknod set_len fail ino {} error {}", inode.id, e);
+                unsafe { reply_err(req, EFAULT) };
+                return;
+            }
             let mut e = inode_to_entry(&inode);
             unsafe { fuse::fuse_reply_entry(req, &mut e) };
         }
@@ -237,14 +251,14 @@ pub extern "C" fn junkfs_ll_unlink(req: fuse::fuse_req_t, parent: fuse::fuse_ino
     }
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.meta().unlink(parent as u64, &name) {
-        Ok(inode) => {
-            if inode.kind == Itype::File && inode.links == 0 {
-                FileStore::unlink(inode.id);
+    match fs.unlink(parent as u64, &name) {
+        Ok(_) => unsafe { reply_err(req, 0) },
+        Err(e) => {
+            if e == EFAULT {
+                log::error!("unlink eFAULT parent {} name {}", parent, name);
             }
-            unsafe { reply_err(req, 0) };
+            unsafe { reply_err(req, e) }
         }
-        Err(e) => unsafe { reply_err(req, e) },
     }
 }
 
@@ -256,9 +270,14 @@ pub extern "C" fn junkfs_ll_rmdir(req: fuse::fuse_req_t, parent: fuse::fuse_ino_
     }
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.meta().unlink(parent as u64, &name) {
+    match fs.unlink(parent as u64, &name) {
         Ok(_) => unsafe { reply_err(req, 0) },
-        Err(e) => unsafe { reply_err(req, e) },
+        Err(e) => {
+            if e == EFAULT {
+                log::error!("rmdir eFAULT parent {} name {}", parent, name);
+            }
+            unsafe { reply_err(req, e) }
+        }
     }
 }
 
@@ -283,7 +302,9 @@ pub extern "C" fn junkfs_ll_symlink(
                 let mut f = h.lock().unwrap();
                 let n = f.write(0, target.as_bytes());
                 if n > 0 {
-                    let _ = fs.meta().update_inode_after_write(ino, n as u64);
+                    if let Err(e) = fs.meta().update_inode_after_write(ino, n as u64) {
+                        log::error!("symlink update inode fail ino {} error {}", ino, e);
+                    }
                 }
                 f.flush(false);
             }
@@ -330,7 +351,7 @@ pub extern "C" fn junkfs_ll_rename(
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
     let newname = unsafe { CStr::from_ptr(newname) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.meta().rename(parent as u64, &name, newparent as u64, &newname) {
+    match fs.rename(parent as u64, &name, newparent as u64, &newname) {
         Ok(_) => unsafe { reply_err(req, 0) },
         Err(e) => unsafe { reply_err(req, e) },
     }
@@ -360,13 +381,39 @@ pub extern "C" fn junkfs_ll_link(
 
 #[no_mangle]
 pub extern "C" fn junkfs_ll_open(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t, fi: *mut fuse::fuse_file_info) {
+    if fi.is_null() {
+        unsafe { reply_err(req, EFAULT) };
+        return;
+    }
     let fs = unsafe { fs_from_req(req) };
+    let flags = unsafe { (*fi).flags };
+    if (flags & libc::O_TRUNC) != 0 {
+        let Some(mut inode) = fs.meta().load_inode(ino as u64) else {
+            unsafe { reply_err(req, ENOENT) };
+            return;
+        };
+        if inode.length > 0 {
+            fs.flush_open_file_handles(ino as u64);
+            if let Err(e) = FileStore::set_len(ino as u64, 0) {
+                log::error!("open truncate set_len fail ino {} error {}", ino, e);
+                unsafe { reply_err(req, EFAULT) };
+                return;
+            }
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            inode.length = 0;
+            inode.mtime = now;
+            inode.ctime = now;
+            if let Err(e) = fs.meta().store_inode(&inode) {
+                log::error!("open truncate store inode fail ino {} error {}", ino, e);
+                unsafe { reply_err(req, EFAULT) };
+                return;
+            }
+        }
+    }
     if let Some(h) = fs.new_file_handle(ino as u64) {
         let fh = h.lock().unwrap().fh;
         unsafe {
-            if !fi.is_null() {
-                (*fi).fh = fh;
-            }
+            (*fi).fh = fh;
             fuse::fuse_reply_open(req, fi);
         }
     } else {
@@ -377,7 +424,7 @@ pub extern "C" fn junkfs_ll_open(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t, f
 #[no_mangle]
 pub extern "C" fn junkfs_ll_read(
     req: fuse::fuse_req_t,
-    _ino: fuse::fuse_ino_t,
+    ino: fuse::fuse_ino_t,
     size: usize,
     off: libc::off_t,
     fi: *mut fuse::fuse_file_info,
@@ -390,6 +437,11 @@ pub extern "C" fn junkfs_ll_read(
     let fh = unsafe { (*fi).fh } as u64;
     if let Some(h) = fs.find_file_handle(fh) {
         let mut f = h.lock().unwrap();
+        if f.ino != ino as u64 {
+            log::error!("read fh ino mismatch req_ino {} handle_ino {} fh {}", ino, f.ino, fh);
+            unsafe { reply_err(req, EIO) };
+            return;
+        }
         let inode = match fs.meta().load_inode(f.ino) {
             Some(i) => i,
             None => {
@@ -426,12 +478,28 @@ pub extern "C" fn junkfs_ll_write(
     fi: *mut fuse::fuse_file_info,
 ) {
     if fi.is_null() || buf.is_null() {
+        log::error!(
+            "write invalid args ino {} off {} size {} fi_null {} buf_null {}",
+            ino,
+            off,
+            size,
+            fi.is_null(),
+            buf.is_null()
+        );
         unsafe { reply_err(req, EFAULT) };
         return;
     }
     let fs = unsafe { fs_from_req(req) };
     let fh = unsafe { (*fi).fh } as u64;
     if let Some(h) = fs.find_file_handle(fh) {
+        {
+            let f = h.lock().unwrap();
+            if f.ino != ino as u64 {
+                log::error!("write fh ino mismatch req_ino {} handle_ino {} fh {}", ino, f.ino, fh);
+                unsafe { reply_err(req, EIO) };
+                return;
+            }
+        }
         let data = unsafe { std::slice::from_raw_parts(buf as *const u8, size) };
         let mut total = 0usize;
         let mut retries = 0u32;
@@ -457,10 +525,24 @@ pub extern "C" fn junkfs_ll_write(
             retries = 0;
         }
         if total > 0 {
-            let _ = fs.meta().update_inode_after_write(ino as u64, off as u64 + total as u64);
+            if let Err(e) = fs
+                .meta()
+                .update_inode_after_write(ino as u64, off as u64 + total as u64)
+            {
+                log::error!(
+                    "write update inode fail ino {} off {} size {} error {}",
+                    ino,
+                    off,
+                    total,
+                    e
+                );
+                unsafe { reply_err(req, EIO) };
+                return;
+            }
         }
         unsafe { fuse::fuse_reply_write(req, total as usize) };
     } else {
+        log::error!("write missing handle ino {} off {} size {} fh {}", ino, off, size, fh);
         unsafe { reply_err(req, ENOENT) };
     }
 }
@@ -577,7 +659,18 @@ pub extern "C" fn junkfs_ll_fsync(
 ) {
     let fs = unsafe { fs_from_req(req) };
     if let Some(h) = if fi.is_null() { None } else { fs.find_file_handle(unsafe { (*fi).fh } as u64) } {
-        h.lock().unwrap().flush(false);
+        let mut f = h.lock().unwrap();
+        if f.ino != ino as u64 {
+            log::error!(
+                "fsync fh ino mismatch req_ino {} handle_ino {} fh {}",
+                ino,
+                f.ino,
+                unsafe { (*fi).fh }
+            );
+            unsafe { reply_err(req, EIO) };
+            return;
+        }
+        f.flush(false);
     }
     let datasync = datasync != 0;
     if let Err(e) = FileStore::fsync(ino as u64, datasync) {
@@ -637,6 +730,15 @@ pub extern "C" fn junkfs_ll_create(
     match fs.meta().mknod(parent as u64, &name, Itype::File, mode as u32) {
         Err(e) => unsafe { reply_err(req, e) },
         Ok(inode) => {
+            let existed = FileStore::exists(inode.id);
+            if existed {
+                log::error!("create reused data file ino {}", inode.id);
+            }
+            if let Err(e) = FileStore::set_len(inode.id, 0) {
+                log::error!("create set_len fail ino {} error {}", inode.id, e);
+                unsafe { reply_err(req, EFAULT) };
+                return;
+            }
             let ino = inode.id;
             if let Some(handle) = fs.new_file_handle(ino) {
                 let fh = handle.lock().unwrap().fh;

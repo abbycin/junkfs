@@ -1,11 +1,10 @@
 use crate::cache::MemPool;
-use crate::meta::{DirHandle, FileHandle, Ino, Meta};
-use crate::store::CacheStore;
+use crate::meta::{DirHandle, FileHandle, Ino, Itype, Meta};
 #[cfg(feature = "stats")]
 use crate::store::snapshot as stats_snapshot;
-use crate::utils::BitMap;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::store::{CacheStore, FileStore};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -53,22 +52,24 @@ impl Writeback {
                     out
                 };
                 for cache in caches_snapshot {
-                    let (ino, bufs) = {
+                    let (ino, res) = {
                         let mut c = cache.lock().unwrap();
                         if !c.should_flush() {
                             continue;
                         }
                         let ino = c.ino();
-                        let bufs = c.take_entries();
-                        (ino, bufs)
+                        let res = c.flush(false);
+                        (ino, res)
                     };
-                    if let Err(e) = CacheStore::flush_entries(ino, bufs, false) {
+                    if let Err(e) = res {
                         log::error!("writeback flush ino {} error {}", ino, e);
                     }
                 }
                 let _ = meta.flush_dirty_inodes();
                 let pending = meta.pending_len();
-                if pending >= META_COMMIT_THRESHOLD || last_commit.elapsed() >= Duration::from_millis(META_COMMIT_INTERVAL_MS) {
+                if pending >= META_COMMIT_THRESHOLD
+                    || last_commit.elapsed() >= Duration::from_millis(META_COMMIT_INTERVAL_MS)
+                {
                     if let Err(e) = meta.commit_pending() {
                         log::error!("commit pending error {}", e);
                     }
@@ -117,7 +118,8 @@ pub struct Fs {
     dir_handles: Vec<Mutex<HashMap<u64, Arc<Mutex<DirHandle>>>>>,
     inode_caches: CacheShards,
     inode_refs: Vec<Mutex<HashMap<Ino, usize>>>,
-    hmap: Mutex<BitMap>,
+    orphan_inodes: Arc<Mutex<HashSet<Ino>>>,
+    next_fh: AtomicU64,
     writeback: Mutex<Writeback>,
     shutdown: AtomicBool,
 }
@@ -133,9 +135,16 @@ impl Fs {
 
         let meta = Arc::new(meta.unwrap());
         let inode_caches: CacheShards = Arc::new((0..INODE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect());
-        let inode_refs = (0..INODE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect::<Vec<_>>();
-        let file_handles = (0..HANDLE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect::<Vec<_>>();
-        let dir_handles = (0..HANDLE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect::<Vec<_>>();
+        let inode_refs = (0..INODE_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect::<Vec<_>>();
+        let file_handles = (0..HANDLE_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect::<Vec<_>>();
+        let dir_handles = (0..HANDLE_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect::<Vec<_>>();
+        let orphan_inodes = Arc::new(Mutex::new(HashSet::new()));
         let writeback = Writeback::start(meta.clone(), inode_caches.clone());
 
         Ok(Fs {
@@ -144,7 +153,8 @@ impl Fs {
             dir_handles,
             inode_caches,
             inode_refs,
-            hmap: Mutex::new(BitMap::new(10240)), // More handles for complex builds
+            orphan_inodes,
+            next_fh: AtomicU64::new(1),
             writeback: Mutex::new(writeback),
             shutdown: AtomicBool::new(false),
         })
@@ -162,13 +172,13 @@ impl Fs {
         }
         let mut ok = true;
         for cache in caches {
-            let (ino, bufs) = {
+            let (ino, res) = {
                 let mut c = cache.lock().unwrap();
                 let ino = c.ino();
-                let bufs = c.take_entries();
-                (ino, bufs)
+                let res = c.flush(false);
+                (ino, res)
             };
-            if let Err(e) = CacheStore::flush_entries(ino, bufs, false) {
+            if let Err(e) = res {
                 log::error!("flush cache ino {} error {}", ino, e);
                 ok = false;
             }
@@ -176,11 +186,12 @@ impl Fs {
         ok
     }
 
+    fn alloc_fh(&self) -> u64 {
+        self.next_fh.fetch_add(1, Ordering::Relaxed)
+    }
+
     pub(crate) fn new_file_handle(&self, ino: Ino) -> Option<Arc<Mutex<FileHandle>>> {
-        let fh = {
-            let mut hmap = self.hmap.lock().unwrap();
-            hmap.alloc()?
-        };
+        let fh = self.alloc_fh();
         let cache = {
             let idx = inode_shard(ino);
             let mut caches = self.inode_caches[idx].lock().unwrap();
@@ -214,9 +225,14 @@ impl Fs {
         };
         if let Some(h) = removed {
             let ino = h.lock().unwrap().ino;
-            self.hmap.lock().unwrap().free(fh);
             self.drop_inode_ref(ino);
         }
+    }
+
+    fn inode_ref_count(&self, ino: Ino) -> usize {
+        let idx = inode_shard(ino);
+        let refs = self.inode_refs[idx].lock().unwrap();
+        refs.get(&ino).copied().unwrap_or(0)
     }
 
     fn drop_inode_ref(&self, ino: Ino) {
@@ -240,20 +256,85 @@ impl Fs {
         }
         let cache = {
             let idx = inode_shard(ino);
-            let mut caches = self.inode_caches[idx].lock().unwrap();
-            caches.remove(&ino)
+            let caches = self.inode_caches[idx].lock().unwrap();
+            caches.get(&ino).cloned()
         };
         if let Some(cache) = cache {
-            let (ino, bufs) = {
+            let (ino, res) = {
                 let mut c = cache.lock().unwrap();
                 let ino = c.ino();
-                let bufs = c.take_entries();
-                (ino, bufs)
+                let res = c.flush(false);
+                (ino, res)
             };
-            if let Err(e) = CacheStore::flush_entries(ino, bufs, false) {
+            if let Err(e) = res {
                 log::error!("flush cache ino {} error {}", ino, e);
+                return;
             }
         }
+        {
+            let idx = inode_shard(ino);
+            let refs = self.inode_refs[idx].lock().unwrap();
+            if refs.get(&ino).copied().unwrap_or(0) > 0 {
+                return;
+            }
+        }
+        {
+            let idx = inode_shard(ino);
+            let mut caches = self.inode_caches[idx].lock().unwrap();
+            caches.remove(&ino);
+        }
+        let finalize = {
+            let mut orphans = self.orphan_inodes.lock().unwrap();
+            orphans.remove(&ino)
+        };
+        if finalize {
+            if let Err(e) = self.meta.finalize_unlink(ino) {
+                log::error!("finalize unlink ino {} error {}", ino, e);
+                self.orphan_inodes.lock().unwrap().insert(ino);
+                return;
+            }
+            FileStore::unlink(ino);
+        }
+    }
+
+    pub(crate) fn unlink(&self, parent: Ino, name: &str) -> Result<crate::meta::Inode, libc::c_int> {
+        let inode = self.meta.lookup(parent, name).ok_or(libc::ENOENT)?;
+        if inode.kind == Itype::File && self.inode_ref_count(inode.id) > 0 {
+            let inode = self.meta.unlink_keep_inode(parent, name)?;
+            if inode.links == 0 {
+                self.orphan_inodes.lock().unwrap().insert(inode.id);
+            }
+            return Ok(inode);
+        }
+        let inode = self.meta.unlink(parent, name)?;
+        if inode.kind == Itype::File && inode.links == 0 {
+            FileStore::unlink(inode.id);
+        }
+        Ok(inode)
+    }
+
+    pub(crate) fn rename(
+        &self,
+        old_parent: Ino,
+        old_name: &str,
+        new_parent: Ino,
+        new_name: &str,
+    ) -> Result<(), libc::c_int> {
+        self.meta
+            .rename_with_unlink(old_parent, old_name, new_parent, new_name, |parent, name, target| {
+                if target.kind == Itype::File && self.inode_ref_count(target.id) > 0 {
+                    let inode = self.meta.unlink_keep_inode(parent, name)?;
+                    if inode.links == 0 {
+                        self.orphan_inodes.lock().unwrap().insert(inode.id);
+                    }
+                    return Ok(());
+                }
+                let inode = self.meta.unlink(parent, name)?;
+                if inode.kind == Itype::File && inode.links == 0 {
+                    FileStore::unlink(inode.id);
+                }
+                Ok(())
+            })
     }
 
     pub(crate) fn new_dir_handle(&self, fh: u64) -> Arc<Mutex<DirHandle>> {
@@ -264,8 +345,7 @@ impl Fs {
     }
 
     pub(crate) fn new_dir_handle_alloc(&self) -> Option<Arc<Mutex<DirHandle>>> {
-        let fh = self.hmap.lock().unwrap().alloc()?;
-        Some(self.new_dir_handle(fh))
+        Some(self.new_dir_handle(self.alloc_fh()))
     }
 
     pub(crate) fn find_dir_handle(&self, fh: u64) -> Option<Arc<Mutex<DirHandle>>> {
@@ -279,9 +359,7 @@ impl Fs {
             let mut map = self.dir_handles[idx].lock().unwrap();
             map.remove(&fh).is_some()
         };
-        if removed {
-            self.hmap.lock().unwrap().free(fh);
-        }
+        if removed {}
     }
 
     pub(crate) fn flush_open_file_handles(&self, ino: Ino) {
@@ -316,13 +394,27 @@ impl Fs {
             caches.extend(map.values().cloned());
         }
         for cache in caches {
-            let (ino, bufs) = {
+            let (ino, res) = {
                 let mut c = cache.lock().unwrap();
                 let ino = c.ino();
-                let bufs = c.take_entries();
-                (ino, bufs)
+                let res = c.flush(true);
+                (ino, res)
             };
-            let _ = CacheStore::flush_entries(ino, bufs, true);
+            if let Err(e) = res {
+                log::error!("flush cache ino {} error {}", ino, e);
+            }
+        }
+        let orphans = {
+            let mut set = self.orphan_inodes.lock().unwrap();
+            set.drain().collect::<Vec<_>>()
+        };
+        for ino in orphans {
+            if let Err(e) = self.meta.finalize_unlink(ino) {
+                log::error!("finalize unlink ino {} error {}", ino, e);
+                self.orphan_inodes.lock().unwrap().insert(ino);
+                continue;
+            }
+            FileStore::unlink(ino);
         }
         if let Err(e) = self.meta.sync() {
             log::error!("sync metadata on drop error {}", e);

@@ -8,6 +8,7 @@ use crate::meta::{DirHandle, MetaKV};
 use crate::utils::{init_data_path, BitMap64};
 use libc::{EEXIST, EFAULT, ENOENT, ENOTEMPTY};
 use mace::{Mace, OpCode, Options};
+use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,7 +37,9 @@ pub struct Meta {
     state: Mutex<MetaState>,
     inode_cache: RwLock<HashMap<Ino, InodeCache>>,
     dirty_inodes: Mutex<HashSet<Ino>>,
+    deleting_inodes: Mutex<HashSet<Ino>>,
     pending: Mutex<Pending>,
+    pending_free: Mutex<Vec<Ino>>,
     dentry_cache: Mutex<LRUCache<String, DentryCacheValue>>,
     dir_index: Mutex<HashMap<Ino, DirIndex>>,
 }
@@ -61,6 +64,14 @@ enum PendingValue {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum InodeLiveness {
+    PendingPut,
+    PendingDel,
+    Committed,
+    Missing,
+}
+
 #[derive(Clone, Copy)]
 enum DentryCacheValue {
     Present(Ino),
@@ -75,8 +86,102 @@ struct DirIndex {
 const DENTRY_CACHE_CAP: usize = 1 << 18;
 const PENDING_COMMIT_BATCH: usize = 4096;
 const PENDING_COMMIT_BYTES: usize = 4 << 20;
+static STRICT_INVARIANT: Lazy<bool> = Lazy::new(|| {
+    std::env::var("JUNK_STRICT_INVARIANT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+});
+static ENABLE_INO_REUSE: Lazy<bool> = Lazy::new(|| {
+    std::env::var("JUNK_ENABLE_INO_REUSE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+});
 
 impl Meta {
+    fn strict_invariant_enabled() -> bool {
+        *STRICT_INVARIANT
+    }
+
+    fn inode_reuse_enabled() -> bool {
+        *ENABLE_INO_REUSE
+    }
+
+    fn mark_inode_deleting(&self, ino: Ino) {
+        self.deleting_inodes.lock().unwrap().insert(ino);
+    }
+
+    fn clear_inode_deleting(&self, ino: Ino) {
+        self.deleting_inodes.lock().unwrap().remove(&ino);
+    }
+
+    fn inode_is_deleting(&self, ino: Ino) -> bool {
+        self.deleting_inodes.lock().unwrap().contains(&ino)
+    }
+
+    fn inode_liveness(&self, ino: Ino) -> InodeLiveness {
+        let key = Inode::key(ino);
+        match self.pending_get(&key) {
+            PendingValue::Put(_) => InodeLiveness::PendingPut,
+            PendingValue::Deleted => InodeLiveness::PendingDel,
+            PendingValue::Missing => {
+                if self.meta.contains_key(&key).unwrap_or(false) {
+                    InodeLiveness::Committed
+                } else {
+                    InodeLiveness::Missing
+                }
+            }
+        }
+    }
+
+    fn inode_has_live_dentry(&self, ino: Ino) -> bool {
+        let (dentry_puts, dentry_dels) = {
+            let pending = self.pending.lock().unwrap();
+            let mut puts = HashMap::new();
+            for (k, v) in &pending.puts {
+                if k.starts_with("d_") {
+                    puts.insert(k.clone(), v.clone());
+                }
+            }
+            (puts, pending.dels.clone())
+        };
+
+        for data in dentry_puts.values() {
+            if let Ok(de) = bincode::deserialize::<Dentry>(data) {
+                if de.ino == ino {
+                    return true;
+                }
+            }
+        }
+
+        let view = self.meta.view();
+        let mut it = view.seek("d_");
+        while let Some(item) = it.next() {
+            if !item.key().starts_with(b"d_") {
+                break;
+            }
+            let key = String::from_utf8_lossy(item.key()).to_string();
+            if dentry_dels.contains(&key) || dentry_puts.contains_key(&key) {
+                continue;
+            }
+            if let Ok(de) = bincode::deserialize::<Dentry>(item.val()) {
+                if de.ino == ino {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn put_priority(key: &str) -> u8 {
+        if key.starts_with("i_") {
+            0
+        } else if key.starts_with("d_") {
+            2
+        } else {
+            1
+        }
+    }
+
     // write superblock
     pub fn format(meta_path: &str, store_path: &str) -> Result<(), String> {
         let mut opt = Options::new(meta_path);
@@ -152,7 +257,9 @@ impl Meta {
                             state: Mutex::new(state),
                             inode_cache: RwLock::new(HashMap::new()),
                             dirty_inodes: Mutex::new(HashSet::new()),
+                            deleting_inodes: Mutex::new(HashSet::new()),
                             pending: Mutex::new(Pending::new()),
+                            pending_free: Mutex::new(Vec::new()),
                             dentry_cache: Mutex::new(LRUCache::new(DENTRY_CACHE_CAP)),
                             dir_index: Mutex::new(HashMap::new()),
                         })
@@ -345,6 +452,68 @@ impl Meta {
         self.commit_pending_inner().map_err(|e| e.to_string())
     }
 
+    fn apply_pending_frees(&self) {
+        if !Self::inode_reuse_enabled() {
+            self.pending_free.lock().unwrap().clear();
+            return;
+        }
+        let ready = {
+            let pending = self.pending.lock().unwrap();
+            let mut frees = self.pending_free.lock().unwrap();
+            if frees.is_empty() {
+                return;
+            }
+            let mut ready = Vec::new();
+            let mut keep = Vec::new();
+            for ino in frees.drain(..) {
+                let key = Inode::key(ino);
+                if pending.dels.contains(&key) || pending.puts.contains_key(&key) {
+                    keep.push(ino);
+                } else {
+                    ready.push(ino);
+                }
+            }
+            *frees = keep;
+            ready
+        };
+        if ready.is_empty() {
+            return;
+        }
+        let meta = &self.meta;
+        let mut retry = Vec::new();
+        {
+            let mut state = self.state.lock().unwrap();
+            for ino in ready {
+                if Self::strict_invariant_enabled() && self.inode_has_live_dentry(ino) {
+                    log::error!("invariant violated free inode {} while dentry still live", ino);
+                    panic!("free inode with live dentry");
+                }
+                let plan = match state.imap.free_plan(ino, &mut |gid| Self::load_imap_group(meta, gid)) {
+                    Ok(Some(plan)) => plan,
+                    Ok(None) => {
+                        log::error!("imap free_plan none at apply ino {}", ino);
+                        continue;
+                    }
+                    Err(e) => {
+                        log::error!("imap free_plan error at apply ino {} err {}", ino, e);
+                        retry.push(ino);
+                        continue;
+                    }
+                };
+                let summary_val = plan.summary_val();
+                let group_val = plan.group_val();
+                let gid = plan.gid;
+                state.imap.apply_free(plan);
+                self.stage_put(InoMap::summary_key(), summary_val);
+                self.stage_put(InoMap::group_key(gid), group_val);
+            }
+        }
+        if !retry.is_empty() {
+            let mut frees = self.pending_free.lock().unwrap();
+            frees.extend(retry);
+        }
+    }
+
     fn commit_pending_inner(&self) -> Result<(), OpCode> {
         let mut batch_limit = PENDING_COMMIT_BATCH;
         loop {
@@ -355,18 +524,29 @@ impl Meta {
                 }
                 let mut puts = Vec::new();
                 let mut bytes = 0usize;
-                for (k, v) in pending.puts.iter().take(batch_limit) {
+                let mut put_keys = pending.puts.keys().cloned().collect::<Vec<_>>();
+                put_keys.sort_by_key(|k| Self::put_priority(k));
+                for k in put_keys.into_iter().take(batch_limit) {
+                    let Some(v) = pending.puts.get(&k) else {
+                        continue;
+                    };
                     let add = k.len() + v.len();
                     if !puts.is_empty() && bytes + add > PENDING_COMMIT_BYTES {
                         break;
                     }
                     bytes += add;
-                    puts.push((k.clone(), v.clone()));
+                    puts.push((k, v.clone()));
                 }
                 let mut dels = Vec::new();
                 let remain = batch_limit.saturating_sub(puts.len());
                 if remain > 0 {
-                    for k in pending.dels.iter().take(remain) {
+                    let has_dentry = pending.dels.iter().any(|k| k.starts_with("d_"));
+                    let iter: Box<dyn Iterator<Item = &String>> = if has_dentry {
+                        Box::new(pending.dels.iter().filter(|k| k.starts_with("d_")))
+                    } else {
+                        Box::new(pending.dels.iter())
+                    };
+                    for k in iter.take(remain) {
                         if !puts.is_empty() && bytes + k.len() > PENDING_COMMIT_BYTES {
                             break;
                         }
@@ -382,20 +562,23 @@ impl Meta {
             let res = self.commit_pending_batch(&puts, &dels);
             match res {
                 Ok(()) => {
-                    let mut pending = self.pending.lock().unwrap();
-                    for (k, v) in puts {
-                        if let Some(cur) = pending.puts.get(&k) {
-                            if *cur == v {
-                                pending.puts.remove(&k);
+                    {
+                        let mut pending = self.pending.lock().unwrap();
+                        for (k, v) in puts {
+                            if let Some(cur) = pending.puts.get(&k) {
+                                if *cur == v {
+                                    pending.puts.remove(&k);
+                                }
                             }
                         }
-                    }
-                    for k in dels {
-                        if pending.dels.contains(&k) && !pending.puts.contains_key(&k) {
-                            pending.dels.remove(&k);
+                        for k in dels {
+                            if pending.dels.contains(&k) && !pending.puts.contains_key(&k) {
+                                pending.dels.remove(&k);
+                            }
                         }
+                        batch_limit = PENDING_COMMIT_BATCH;
                     }
-                    batch_limit = PENDING_COMMIT_BATCH;
+                    self.apply_pending_frees();
                 }
                 Err(OpCode::AbortTx) => {
                     if batch_limit <= 1 {
@@ -497,20 +680,20 @@ impl Meta {
     }
 
     fn cache_put(&self, inode: Inode, dirty: bool) {
+        if self.inode_is_deleting(inode.id) {
+            return;
+        }
         let mut cache = self.inode_cache.write().unwrap();
-        cache.insert(
-            inode.id,
-            InodeCache {
-                inode,
-                dirty,
-            },
-        );
+        cache.insert(inode.id, InodeCache { inode, dirty });
         if dirty {
             self.dirty_inodes.lock().unwrap().insert(inode.id);
         }
     }
 
     fn cache_mark_dirty(&self, inode: Inode) {
+        if self.inode_is_deleting(inode.id) {
+            return;
+        }
         let mut cache = self.inode_cache.write().unwrap();
         match cache.get_mut(&inode.id) {
             Some(e) => {
@@ -518,13 +701,7 @@ impl Meta {
                 e.dirty = true;
             }
             None => {
-                cache.insert(
-                    inode.id,
-                    InodeCache {
-                        inode,
-                        dirty: true,
-                    },
-                );
+                cache.insert(inode.id, InodeCache { inode, dirty: true });
             }
         }
         self.dirty_inodes.lock().unwrap().insert(inode.id);
@@ -537,6 +714,9 @@ impl Meta {
     }
 
     pub fn update_inode_after_write(&self, ino: Ino, end_off: u64) -> Result<(), String> {
+        if self.inode_is_deleting(ino) {
+            return Ok(());
+        }
         let mut inode = match self.cache_get(ino) {
             Some(i) => i,
             None => self.load_inode(ino).ok_or_else(|| "can't load inode".to_string())?,
@@ -566,6 +746,9 @@ impl Meta {
         {
             let cache = self.inode_cache.read().unwrap();
             for ino in dirty_set {
+                if self.inode_is_deleting(ino) {
+                    continue;
+                }
                 if let Some(e) = cache.get(&ino) {
                     if e.dirty {
                         dirty.push((ino, e.inode));
@@ -602,6 +785,9 @@ impl Meta {
     }
 
     pub fn flush_inode(&self, ino: Ino) -> Result<(), String> {
+        if self.inode_is_deleting(ino) {
+            return Ok(());
+        }
         let entry = {
             let cache = self.inode_cache.read().unwrap();
             cache.get(&ino).copied()
@@ -719,6 +905,20 @@ impl Meta {
             .map_err(|_| EFAULT)?
             .ok_or(ENOENT)?;
         let ino = plan.ino;
+        let liveness = self.inode_liveness(ino);
+        if Self::strict_invariant_enabled() && !matches!(liveness, InodeLiveness::Missing) {
+            let inode = self.load_inode(ino);
+            let live_dentry = self.inode_has_live_dentry(ino);
+            log::error!(
+                "invariant violated alloc inode {} liveness {:?} inode {:?} live_dentry {}",
+                ino,
+                liveness,
+                inode,
+                live_dentry
+            );
+            panic!("alloc reused live inode");
+        }
+        self.clear_inode_deleting(ino);
 
         let inode = Inode {
             id: ino,
@@ -771,25 +971,126 @@ impl Meta {
             return Ok(inode);
         }
 
-        let meta = &self.meta;
-        let mut state = self.state.lock().unwrap();
-        let plan = state
-            .imap
-            .free_plan(inode.id, &mut |gid| Self::load_imap_group(meta, gid))
-            .map_err(|_| EFAULT)?
-            .ok_or(EFAULT)?;
-        debug_assert_eq!(plan.ino, inode.id);
+        if Self::inode_reuse_enabled() {
+            let meta = &self.meta;
+            let plan = {
+                let mut state = self.state.lock().unwrap();
+                match state
+                    .imap
+                    .free_plan(inode.id, &mut |gid| Self::load_imap_group(meta, gid))
+                {
+                    Ok(Some(plan)) => plan,
+                    Ok(None) => {
+                        log::error!(
+                            "imap free_plan none ino {} parent {} name {} kind {:?} links {}",
+                            inode.id,
+                            parent,
+                            name,
+                            inode.kind,
+                            inode.links
+                        );
+                        return Err(EFAULT);
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "imap free_plan error ino {} parent {} name {} err {}",
+                            inode.id,
+                            parent,
+                            name,
+                            e
+                        );
+                        return Err(EFAULT);
+                    }
+                }
+            };
+            debug_assert_eq!(plan.ino, inode.id);
+        }
 
+        self.mark_inode_deleting(inode.id);
         self.stage_del(Inode::key(inode.id));
         self.stage_del(dkey);
-        self.stage_put(InoMap::summary_key(), plan.summary_val());
-        self.stage_put(InoMap::group_key(plan.gid), plan.group_val());
-
-        state.imap.apply_free(plan);
-        drop(state);
+        if Self::inode_reuse_enabled() {
+            self.pending_free.lock().unwrap().push(inode.id);
+        }
         self.cache_remove(inode.id);
         inode.links = 0;
         Ok(inode)
+    }
+
+    pub fn unlink_keep_inode(&self, parent: Ino, name: &str) -> Result<Inode, libc::c_int> {
+        let mut inode = self.lookup(parent, name).ok_or(ENOENT)?;
+
+        if inode.kind == Itype::Dir {
+            if self.dir_has_entries(inode.id) {
+                return Err(ENOTEMPTY);
+            }
+        }
+
+        let dkey = Dentry::key(parent, name);
+
+        if inode.kind != Itype::Dir && inode.links > 1 {
+            inode.links -= 1;
+            inode.ctime = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("can't get unix timestamp")
+                .as_secs();
+            self.stage_put(Inode::key(inode.id), inode.val());
+            self.stage_del(dkey);
+            self.cache_put(inode, false);
+            return Ok(inode);
+        }
+
+        inode.links = 0;
+        inode.ctime = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("can't get unix timestamp")
+            .as_secs();
+        self.stage_put(Inode::key(inode.id), inode.val());
+        self.stage_del(dkey);
+        self.cache_put(inode, false);
+        Ok(inode)
+    }
+
+    pub fn finalize_unlink(&self, ino: Ino) -> Result<(), libc::c_int> {
+        let inode = match self.load_inode(ino) {
+            Some(inode) => inode,
+            None => {
+                log::error!("finalize_unlink missing inode {}", ino);
+                return Err(ENOENT);
+            }
+        };
+        if inode.links != 0 {
+            return Ok(());
+        }
+        if Self::inode_reuse_enabled() {
+            let meta = &self.meta;
+            let plan = {
+                let mut state = self.state.lock().unwrap();
+                match state
+                    .imap
+                    .free_plan(inode.id, &mut |gid| Self::load_imap_group(meta, gid))
+                {
+                    Ok(Some(plan)) => plan,
+                    Ok(None) => {
+                        log::error!("imap free_plan none ino {} finalize", inode.id);
+                        return Err(EFAULT);
+                    }
+                    Err(e) => {
+                        log::error!("imap free_plan error ino {} finalize err {}", inode.id, e);
+                        return Err(EFAULT);
+                    }
+                }
+            };
+            debug_assert_eq!(plan.ino, inode.id);
+        }
+
+        self.mark_inode_deleting(inode.id);
+        self.stage_del(Inode::key(inode.id));
+        if Self::inode_reuse_enabled() {
+            self.pending_free.lock().unwrap().push(inode.id);
+        }
+        self.cache_remove(inode.id);
+        Ok(())
     }
 
     pub fn load_inode(&self, inode: Ino) -> Option<Inode> {
@@ -797,27 +1098,43 @@ impl Meta {
             return Some(i);
         }
         let key = Inode::key(inode);
-        match self.meta.get_optional(&key) {
-            Ok(Some(tmp)) => {
-                let inode = bincode::deserialize::<Inode>(&tmp);
+        match self.pending_get(&key) {
+            PendingValue::Put(v) => {
+                let inode = bincode::deserialize::<Inode>(&v);
                 if inode.is_err() {
-                    log::error!("deserialize inode fail error {}", inode.err().unwrap());
+                    log::error!("deserialize pending inode fail error {}", inode.err().unwrap());
                     return None;
                 }
                 let inode = inode.unwrap();
                 self.cache_put(inode, false);
                 Some(inode)
             }
-            Ok(None) => None,
-            Err(e) => {
-                log::error!("load inode error {}", e);
-                None
-            }
+            PendingValue::Deleted => None,
+            PendingValue::Missing => match self.meta.get_optional(&key) {
+                Ok(Some(tmp)) => {
+                    let inode = bincode::deserialize::<Inode>(&tmp);
+                    if inode.is_err() {
+                        log::error!("deserialize inode fail error {}", inode.err().unwrap());
+                        return None;
+                    }
+                    let inode = inode.unwrap();
+                    self.cache_put(inode, false);
+                    Some(inode)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    log::error!("load inode error {}", e);
+                    None
+                }
+            },
         }
     }
 
     /// if `key` exist, we can overwrite it
     pub fn store_inode(&self, inode: &Inode) -> Result<(), String> {
+        if self.inode_is_deleting(inode.id) {
+            return Ok(());
+        }
         self.cache_mark_dirty(*inode);
         Ok(())
     }
@@ -842,7 +1159,10 @@ impl Meta {
             map.get(&ino).map(|idx| idx.entries.clone()).unwrap_or_default()
         };
         for (name, ino) in entries {
-            let inode = self.load_inode(ino).expect("can't load inode");
+            let Some(inode) = self.load_inode(ino) else {
+                log::error!("dangling dentry parent {} name {} ino {}", self_inode.id, name, ino);
+                continue;
+            };
             let key = Dentry::key(self_inode.id, &name);
             self.dentry_cache_put(key, DentryCacheValue::Present(ino));
             h.add(NameT {
@@ -890,13 +1210,23 @@ impl Meta {
         Ok(())
     }
 
-    pub fn rename(
+    pub fn rename(&self, old_parent: Ino, old_name: &str, new_parent: Ino, new_name: &str) -> Result<(), libc::c_int> {
+        self.rename_with_unlink(old_parent, old_name, new_parent, new_name, |parent, name, _| {
+            self.unlink(parent, name).map(|_| ())
+        })
+    }
+
+    pub fn rename_with_unlink<F>(
         &self,
         old_parent: Ino,
         old_name: &str,
         new_parent: Ino,
         new_name: &str,
-    ) -> Result<(), libc::c_int> {
+        mut unlink: F,
+    ) -> Result<(), libc::c_int>
+    where
+        F: FnMut(Ino, &str, &Inode) -> Result<(), libc::c_int>,
+    {
         if old_parent == new_parent && old_name == new_name {
             return Ok(());
         }
@@ -909,8 +1239,7 @@ impl Meta {
                     return Err(ENOTEMPTY);
                 }
             }
-            // unlink target dentry and dec nlink
-            self.unlink(new_parent, new_name)?;
+            unlink(new_parent, new_name, &old_target_inode)?;
         }
 
         let dkey = Dentry::key(old_parent, old_name);

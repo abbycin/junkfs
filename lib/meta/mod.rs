@@ -50,8 +50,7 @@ impl FileHandle {
 }
 
 impl Drop for FileHandle {
-    fn drop(&mut self) {
-    }
+    fn drop(&mut self) {}
 }
 
 pub struct DirHandle {

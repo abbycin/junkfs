@@ -69,9 +69,21 @@ impl MemPool {
     }
 
     pub fn free(&mut self, ptr: *mut u8) {
+        if ptr.is_null() {
+            log::error!("mempool free null ptr");
+            panic!("mempool free null");
+        }
         unsafe {
             let off = ptr.offset_from(self.ptr) as u64;
+            if off >= self.cap as u64 || off % FS_PAGE_SIZE != 0 {
+                log::error!("mempool free invalid ptr {:?} off {} cap {}", ptr, off, self.cap);
+                panic!("mempool free invalid ptr");
+            }
             let bit = off / FS_PAGE_SIZE;
+            if !self.dmap.test(bit) {
+                log::error!("mempool double free ptr {:?} bit {}", ptr, bit);
+                panic!("mempool double free");
+            }
             self.dmap.del(bit);
         }
     }

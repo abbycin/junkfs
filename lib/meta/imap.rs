@@ -149,10 +149,7 @@ impl InoMap {
         let mut summary = self.summary.clone();
         let mut start_gid = self.summary_cursor;
         for _ in 0..self.group_count {
-            let gid = match summary
-                .find_one_from(start_gid)
-                .or_else(|| summary.find_one_from(0))
-            {
+            let gid = match summary.find_one_from(start_gid).or_else(|| summary.find_one_from(0)) {
                 Some(x) => x,
                 None => return Ok(None),
             };
@@ -164,11 +161,7 @@ impl InoMap {
                 start_gid = if gid + 1 >= self.group_count { 0 } else { gid + 1 };
                 continue;
             }
-            let start = if self.group_cursor[gid as usize] >= gcap {
-                0
-            } else {
-                self.group_cursor[gid as usize]
-            };
+            let start = if self.group_cursor[gid as usize] >= gcap { 0 } else { self.group_cursor[gid as usize] };
             let bit = match group.find_zero_from(start).or_else(|| group.find_zero_from(0)) {
                 Some(x) => x,
                 None => {
