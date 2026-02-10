@@ -155,7 +155,7 @@ impl Meta {
 
         let view = self.meta.view();
         let mut it = view.seek("d_");
-        while let Some(item) = it.next() {
+        for item in it {
             if !item.key().starts_with(b"d_") {
                 break;
             }
@@ -348,9 +348,9 @@ impl Meta {
             return None;
         }
         let rest = &key[2..];
-        let mut it = rest.splitn(2, '_');
-        let parent_str = it.next()?;
-        let name = it.next()?;
+        let (parent_str, name) = rest.split_once('_')?;
+        
+        
         let parent = parent_str.parse::<Ino>().ok()?;
         Some((parent, name.to_string()))
     }
@@ -452,6 +452,76 @@ impl Meta {
         self.commit_pending_inner().map_err(|e| e.to_string())
     }
 
+    fn take_pending_batch(&self, batch_limit: usize) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.puts.is_empty() && pending.dels.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let mut puts = Vec::new();
+        let mut bytes = 0usize;
+        let mut put_keys = pending.puts.keys().cloned().collect::<Vec<_>>();
+        put_keys.sort_by_key(|k| Self::put_priority(k));
+        for k in put_keys.into_iter().take(batch_limit) {
+            let Some(v) = pending.puts.get(&k) else {
+                continue;
+            };
+            let add = k.len() + v.len();
+            if !puts.is_empty() && bytes + add > PENDING_COMMIT_BYTES {
+                break;
+            }
+            bytes += add;
+            let v = pending.puts.remove(&k).expect("pending put missing");
+            puts.push((k, v));
+        }
+
+        let mut dels = Vec::new();
+        let remain = batch_limit.saturating_sub(puts.len());
+        if remain > 0 {
+            let has_dentry = pending.dels.iter().any(|k| k.starts_with("d_"));
+            let keys = if has_dentry {
+                pending
+                    .dels
+                    .iter()
+                    .filter(|k| k.starts_with("d_"))
+                    .take(remain)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                pending.dels.iter().take(remain).cloned().collect::<Vec<_>>()
+            };
+            for k in keys {
+                if !puts.is_empty() && bytes + k.len() > PENDING_COMMIT_BYTES {
+                    break;
+                }
+                bytes += k.len();
+                if pending.dels.remove(&k) {
+                    dels.push(k);
+                }
+            }
+        }
+        (puts, dels)
+    }
+
+    fn restore_pending_batch(&self, puts: Vec<(String, Vec<u8>)>, dels: Vec<String>) {
+        if puts.is_empty() && dels.is_empty() {
+            return;
+        }
+        let mut pending = self.pending.lock().unwrap();
+        for (k, v) in puts {
+            if pending.puts.contains_key(&k) || pending.dels.contains(&k) {
+                continue;
+            }
+            pending.puts.insert(k, v);
+        }
+        for k in dels {
+            if pending.puts.contains_key(&k) {
+                continue;
+            }
+            pending.dels.insert(k);
+        }
+    }
+
     fn apply_pending_frees(&self) {
         if !Self::inode_reuse_enabled() {
             self.pending_free.lock().unwrap().clear();
@@ -543,80 +613,31 @@ impl Meta {
     fn commit_pending_inner(&self) -> Result<(), OpCode> {
         let mut batch_limit = PENDING_COMMIT_BATCH;
         loop {
-            let (puts, dels) = {
-                let pending = self.pending.lock().unwrap();
-                if pending.puts.is_empty() && pending.dels.is_empty() {
-                    drop(pending);
-                    self.apply_pending_frees();
-                    let pending = self.pending.lock().unwrap();
-                    if pending.puts.is_empty() && pending.dels.is_empty() {
-                        return Ok(());
-                    }
-                    drop(pending);
-                    continue;
-                }
-                let mut puts = Vec::new();
-                let mut bytes = 0usize;
-                let mut put_keys = pending.puts.keys().cloned().collect::<Vec<_>>();
-                put_keys.sort_by_key(|k| Self::put_priority(k));
-                for k in put_keys.into_iter().take(batch_limit) {
-                    let Some(v) = pending.puts.get(&k) else {
-                        continue;
-                    };
-                    let add = k.len() + v.len();
-                    if !puts.is_empty() && bytes + add > PENDING_COMMIT_BYTES {
-                        break;
-                    }
-                    bytes += add;
-                    puts.push((k, v.clone()));
-                }
-                let mut dels = Vec::new();
-                let remain = batch_limit.saturating_sub(puts.len());
-                if remain > 0 {
-                    let has_dentry = pending.dels.iter().any(|k| k.starts_with("d_"));
-                    let iter: Box<dyn Iterator<Item = &String>> = if has_dentry {
-                        Box::new(pending.dels.iter().filter(|k| k.starts_with("d_")))
-                    } else {
-                        Box::new(pending.dels.iter())
-                    };
-                    for k in iter.take(remain) {
-                        if !puts.is_empty() && bytes + k.len() > PENDING_COMMIT_BYTES {
-                            break;
-                        }
-                        bytes += k.len();
-                        dels.push(k.clone());
-                    }
-                }
-                (puts, dels)
-            };
+            let mut batch = self.take_pending_batch(batch_limit);
+            if batch.0.is_empty() && batch.1.is_empty() {
+                self.apply_pending_frees();
+                batch = self.take_pending_batch(batch_limit);
+            }
+            let (puts, dels) = batch;
             if puts.is_empty() && dels.is_empty() {
                 return Ok(());
             }
             let res = self.commit_pending_batch(&puts, &dels);
             match res {
                 Ok(()) => {
-                    let mut pending = self.pending.lock().unwrap();
-                    for (k, v) in puts {
-                        if let Some(cur) = pending.puts.get(&k) {
-                            if *cur == v {
-                                pending.puts.remove(&k);
-                            }
-                        }
-                    }
-                    for k in dels {
-                        if pending.dels.contains(&k) && !pending.puts.contains_key(&k) {
-                            pending.dels.remove(&k);
-                        }
-                    }
                     batch_limit = PENDING_COMMIT_BATCH;
                 }
                 Err(OpCode::AbortTx) => {
+                    self.restore_pending_batch(puts, dels);
                     if batch_limit <= 1 {
                         return Err(OpCode::AbortTx);
                     }
                     batch_limit = (batch_limit / 2).max(1);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.restore_pending_batch(puts, dels);
+                    return Err(e);
+                }
             }
         }
     }
@@ -662,7 +683,7 @@ impl Meta {
         }
         let view = self.meta.view();
         let mut it = view.seek(&prefix);
-        while let Some(item) = it.next() {
+        for item in it {
             if !item.key().starts_with(prefix.as_bytes()) {
                 break;
             }
@@ -992,11 +1013,10 @@ impl Meta {
     pub fn unlink(&self, parent: Ino, name: &str) -> Result<Inode, libc::c_int> {
         let mut inode = self.lookup(parent, name).ok_or(ENOENT)?;
 
-        if inode.kind == Itype::Dir {
-            if self.dir_has_entries(inode.id) {
+        if inode.kind == Itype::Dir
+            && self.dir_has_entries(inode.id) {
                 return Err(ENOTEMPTY);
             }
-        }
 
         let dkey = Dentry::key(parent, name);
 
@@ -1026,11 +1046,10 @@ impl Meta {
     pub fn unlink_keep_inode(&self, parent: Ino, name: &str) -> Result<Inode, libc::c_int> {
         let mut inode = self.lookup(parent, name).ok_or(ENOENT)?;
 
-        if inode.kind == Itype::Dir {
-            if self.dir_has_entries(inode.id) {
+        if inode.kind == Itype::Dir
+            && self.dir_has_entries(inode.id) {
                 return Err(ENOTEMPTY);
             }
-        }
 
         let dkey = Dentry::key(parent, name);
 
@@ -1219,11 +1238,10 @@ impl Meta {
         let inode = self.lookup(old_parent, old_name).ok_or(ENOENT)?;
 
         if let Some(old_target_inode) = self.lookup(new_parent, new_name) {
-            if old_target_inode.kind == Itype::Dir {
-                if self.dir_has_entries(old_target_inode.id) {
+            if old_target_inode.kind == Itype::Dir
+                && self.dir_has_entries(old_target_inode.id) {
                     return Err(ENOTEMPTY);
                 }
-            }
             unlink(new_parent, new_name, &old_target_inode)?;
         }
 

@@ -52,6 +52,17 @@ impl FileStore {
         *VERIFY_FLUSH
     }
 
+    fn advise_dontneed(fp: &std::fs::File, off: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let fd = fp.as_raw_fd();
+        let rc = unsafe { libc::posix_fadvise(fd, off as libc::off_t, len as libc::off_t, libc::POSIX_FADV_DONTNEED) };
+        if rc != 0 {
+            log::warn!("posix_fadvise failed off {} len {} rc {}", off, len, rc);
+        }
+    }
+
     fn range_overlaps(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
         a_start < b_end && b_start < a_end
     }
@@ -366,6 +377,7 @@ impl FileStore {
                 return Err("short write".to_string());
             }
             record_pwritev(total, ns);
+            Self::advise_dontneed(fp, start_off, total);
         }
         Ok(())
     }
@@ -410,6 +422,7 @@ impl FileStore {
         }
         let ns = start.elapsed().as_nanos() as u64;
         record_pwritev(written as u64, ns);
+        Self::advise_dontneed(fp, off, written as u64);
         Ok(written)
     }
 

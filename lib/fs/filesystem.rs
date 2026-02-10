@@ -131,7 +131,7 @@ impl Fs {
             return Err(meta.err().unwrap());
         }
 
-        MemPool::init(512 << 20);
+        MemPool::init(256 << 20);
 
         let meta = Arc::new(meta.unwrap());
         let inode_caches: CacheShards = Arc::new((0..INODE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect());

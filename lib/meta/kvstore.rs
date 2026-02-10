@@ -23,6 +23,11 @@ impl MaceStore {
         opt.gc_eager = true;
         opt.data_garbage_ratio = 10;
         opt.gc_timeout = 10000; // 10s
+        opt.cache_capacity = 256 << 20;
+        opt.cache_count = 4096;
+        opt.stat_mask_cache_count = 4096;
+        opt.data_handle_cache_capacity = 64;
+        opt.blob_handle_cache_capacity = 64;
 
         let db = Mace::new(opt.validate().unwrap()).unwrap();
         let bucket = Self::open_bucket(&db).unwrap();
