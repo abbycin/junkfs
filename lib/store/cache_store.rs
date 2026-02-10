@@ -65,11 +65,10 @@ impl CacheStore {
         if !Self::direct_candidate(off, data.len()) {
             return None;
         }
-        if !self.bufs.is_empty() {
-            if self.flush(false).is_err() {
+        if !self.bufs.is_empty()
+            && self.flush(false).is_err() {
                 return None;
             }
-        }
         match FileStore::write_at(self.ino, off, data, false) {
             Ok(n) => {
                 self.last_write = Instant::now();
@@ -155,10 +154,10 @@ impl CacheStore {
         if len < DIRECT_WRITE_MIN {
             return false;
         }
-        if off % FS_PAGE_SIZE != 0 {
+        if !off.is_multiple_of(FS_PAGE_SIZE) {
             return false;
         }
-        (len as u64) % FS_PAGE_SIZE == 0
+        (len as u64).is_multiple_of(FS_PAGE_SIZE)
     }
 
     fn copy_data(&mut self, src: *const u8, dst: *mut u8, size: usize, blk_id: u64, blk_off: u64, off: u64) {
@@ -185,7 +184,7 @@ impl CacheStore {
         while i < len {
             let sz = min(len - i, FS_PAGE_SIZE as usize);
             let page_off = off + i as u64;
-            if sz as u64 == FS_PAGE_SIZE && page_off % FS_PAGE_SIZE == 0 {
+            if sz as u64 == FS_PAGE_SIZE && page_off.is_multiple_of(FS_PAGE_SIZE) {
                 if let Some(&idx) = self.page_map.get(&page_off) {
                     let dst = self.bufs[idx].data;
                     unsafe {
@@ -208,7 +207,7 @@ impl CacheStore {
                 assert!(ptr < end);
                 self.copy_data(ptr, mem, sz, blk_id, blk_off + i as u64, off + i as u64);
             }
-            if sz as u64 == FS_PAGE_SIZE && page_off % FS_PAGE_SIZE == 0 {
+            if sz as u64 == FS_PAGE_SIZE && page_off.is_multiple_of(FS_PAGE_SIZE) {
                 self.page_map.insert(page_off, self.bufs.len() - 1);
             }
             self.dirty_bytes += sz;

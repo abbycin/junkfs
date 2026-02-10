@@ -43,8 +43,8 @@ impl InoMap {
     pub fn new(total_inodes: u64, group_size: u64) -> Self {
         assert!(total_inodes > 0);
         assert!(group_size > 0);
-        assert!(group_size % 64 == 0);
-        let group_count = (total_inodes + group_size - 1) / group_size;
+        assert!(group_size.is_multiple_of(64));
+        let group_count = total_inodes.div_ceil(group_size);
         let mut summary = BitMap64::new(group_count);
         for gid in 0..group_count {
             summary.set(gid);
@@ -67,7 +67,7 @@ impl InoMap {
     }
 
     pub fn from_summary(total_inodes: u64, group_size: u64, summary: BitMap64) -> Self {
-        let group_count = (total_inodes + group_size - 1) / group_size;
+        let group_count = total_inodes.div_ceil(group_size);
         let groups = vec![None; group_count as usize];
         let group_cursor = vec![0u64; group_count as usize];
         Self {

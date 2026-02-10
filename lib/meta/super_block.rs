@@ -21,8 +21,8 @@ impl SuperBlock {
         let total_inodes = FS_TOTAL_INODES;
         let group_size = FS_IMAP_GROUP_SIZE;
         assert!(group_size > 0);
-        assert!(group_size % 64 == 0);
-        let group_count = (total_inodes + group_size - 1) / group_size;
+        assert!(group_size.is_multiple_of(64));
+        let group_count = total_inodes.div_ceil(group_size);
         SuperBlock {
             ino: FS_ROOT_INODE,
             uri: uri.to_string(),
@@ -52,9 +52,9 @@ impl SuperBlock {
     pub fn check(&self) {
         assert_eq!(self.total_inodes, FS_TOTAL_INODES);
         assert!(self.group_size > 0);
-        assert!(self.group_size % 64 == 0);
+        assert!(self.group_size.is_multiple_of(64));
         assert_eq!(self.version, SUPERBLOCK_VERSION);
-        let expect = (self.total_inodes + self.group_size - 1) / self.group_size;
+        let expect = self.total_inodes.div_ceil(self.group_size);
         assert_eq!(self.group_count, expect);
     }
 

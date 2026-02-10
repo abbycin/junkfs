@@ -75,7 +75,7 @@ impl MemPool {
         }
         unsafe {
             let off = ptr.offset_from(self.ptr) as u64;
-            if off >= self.cap as u64 || off % FS_PAGE_SIZE != 0 {
+            if off >= self.cap as u64 || !off.is_multiple_of(FS_PAGE_SIZE) {
                 log::error!("mempool free invalid ptr {:?} off {} cap {}", ptr, off, self.cap);
                 panic!("mempool free invalid ptr");
             }

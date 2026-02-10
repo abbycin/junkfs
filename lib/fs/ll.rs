@@ -26,7 +26,7 @@ unsafe fn reply_negative(req: fuse::fuse_req_t) {
     e.ino = 0;
     e.attr_timeout = 0.0;
     e.entry_timeout = NEG_TTL_SEC;
-    let _ = fuse::fuse_reply_entry(req, &mut e);
+    let _ = fuse::fuse_reply_entry(req, &e);
 }
 
 fn kind_to_mode(kind: Itype) -> libc::mode_t {
@@ -76,12 +76,12 @@ pub extern "C" fn junkfs_ll_init(userdata: *mut c_void, conn: *mut fuse::fuse_co
         (*conn).max_write = 16 << 20;
         (*conn).max_read = 16 << 20;
         (*conn).max_readahead = 16 << 20;
-        (*conn).want |= fuse::FUSE_CAP_ASYNC_READ as u32;
+        (*conn).want |= fuse::FUSE_CAP_ASYNC_READ;
         let disable_wbc = std::env::var("JUNK_DISABLE_WBC")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if !disable_wbc {
-            (*conn).want |= fuse::FUSE_CAP_WRITEBACK_CACHE as u32;
+            (*conn).want |= fuse::FUSE_CAP_WRITEBACK_CACHE;
         }
     }
 }
@@ -99,10 +99,10 @@ pub extern "C" fn junkfs_ll_lookup(req: fuse::fuse_req_t, parent: fuse::fuse_ino
     }
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.meta().lookup(parent as u64, &name) {
+    match fs.meta().lookup(parent, &name) {
         Some(inode) => {
             let mut e = inode_to_entry(&inode);
-            unsafe { fuse::fuse_reply_entry(req, &mut e) };
+            unsafe { fuse::fuse_reply_entry(req, &e) };
         }
         None => unsafe { reply_negative(req) },
     }
@@ -111,7 +111,7 @@ pub extern "C" fn junkfs_ll_lookup(req: fuse::fuse_req_t, parent: fuse::fuse_ino
 #[no_mangle]
 pub extern "C" fn junkfs_ll_getattr(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t, _fi: *mut fuse::fuse_file_info) {
     let fs = unsafe { fs_from_req(req) };
-    match fs.meta().load_inode(ino as u64) {
+    match fs.meta().load_inode(ino) {
         Some(inode) => {
             let st = inode_to_stat(&inode);
             unsafe { fuse::fuse_reply_attr(req, &st, TTL_SEC) };
@@ -137,7 +137,7 @@ pub extern "C" fn junkfs_ll_setattr(
         }
         &*attr
     };
-    match meta.load_inode(ino as u64) {
+    match meta.load_inode(ino) {
         None => unsafe { reply_err(req, ENOENT) },
         Some(mut inode) => {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -153,9 +153,9 @@ pub extern "C" fn junkfs_ll_setattr(
             if to_set & fuse::FUSE_SET_ATTR_SIZE as i32 != 0 {
                 let size = attr.st_size as u64;
                 if size < inode.length {
-                    fs.flush_open_file_handles(ino as u64);
+                    fs.flush_open_file_handles(ino);
                 }
-                if let Err(e) = FileStore::set_len(ino as u64, size) {
+                if let Err(e) = FileStore::set_len(ino, size) {
                     log::error!("can't set_len ino {} size {} error {}", ino, size, e);
                     unsafe { reply_err(req, EFAULT) };
                     return;
@@ -203,7 +203,7 @@ pub extern "C" fn junkfs_ll_mknod(
     }
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.meta().mknod(parent as u64, &name, Itype::File, mode as u32) {
+    match fs.meta().mknod(parent, &name, Itype::File, mode) {
         Ok(inode) => {
             let existed = FileStore::exists(inode.id);
             if existed {
@@ -215,7 +215,7 @@ pub extern "C" fn junkfs_ll_mknod(
                 }
             }
             let mut e = inode_to_entry(&inode);
-            unsafe { fuse::fuse_reply_entry(req, &mut e) };
+            unsafe { fuse::fuse_reply_entry(req, &e) };
         }
         Err(e) => unsafe { reply_err(req, e) },
     }
@@ -234,10 +234,10 @@ pub extern "C" fn junkfs_ll_mkdir(
     }
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.meta().mknod(parent as u64, &name, Itype::Dir, mode as u32) {
+    match fs.meta().mknod(parent, &name, Itype::Dir, mode) {
         Ok(inode) => {
             let mut e = inode_to_entry(&inode);
-            unsafe { fuse::fuse_reply_entry(req, &mut e) };
+            unsafe { fuse::fuse_reply_entry(req, &e) };
         }
         Err(e) => unsafe { reply_err(req, e) },
     }
@@ -251,7 +251,7 @@ pub extern "C" fn junkfs_ll_unlink(req: fuse::fuse_req_t, parent: fuse::fuse_ino
     }
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.unlink(parent as u64, &name) {
+    match fs.unlink(parent, &name) {
         Ok(_) => unsafe { reply_err(req, 0) },
         Err(e) => {
             if e == EFAULT {
@@ -270,7 +270,7 @@ pub extern "C" fn junkfs_ll_rmdir(req: fuse::fuse_req_t, parent: fuse::fuse_ino_
     }
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.unlink(parent as u64, &name) {
+    match fs.unlink(parent, &name) {
         Ok(_) => unsafe { reply_err(req, 0) },
         Err(e) => {
             if e == EFAULT {
@@ -295,7 +295,7 @@ pub extern "C" fn junkfs_ll_symlink(
     let target = unsafe { CStr::from_ptr(link) }.to_string_lossy().to_string();
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.meta().mknod(parent as u64, &name, Itype::Symlink, 0o777) {
+    match fs.meta().mknod(parent, &name, Itype::Symlink, 0o777) {
         Ok(inode) => {
             let ino = inode.id;
             if let Some(h) = fs.new_file_handle(ino) {
@@ -309,7 +309,7 @@ pub extern "C" fn junkfs_ll_symlink(
                 f.flush(false);
             }
             let mut e = inode_to_entry(&inode);
-            unsafe { fuse::fuse_reply_entry(req, &mut e) };
+            unsafe { fuse::fuse_reply_entry(req, &e) };
         }
         Err(e) => unsafe { reply_err(req, e) },
     }
@@ -318,9 +318,9 @@ pub extern "C" fn junkfs_ll_symlink(
 #[no_mangle]
 pub extern "C" fn junkfs_ll_readlink(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t) {
     let fs = unsafe { fs_from_req(req) };
-    if let Some(inode) = fs.meta().load_inode(ino as u64) {
+    if let Some(inode) = fs.meta().load_inode(ino) {
         let len = inode.length as usize;
-        if let Some(h) = fs.new_file_handle(ino as u64) {
+        if let Some(h) = fs.new_file_handle(ino) {
             let mut f = h.lock().unwrap();
             if let Some(data) = f.read(0, len) {
                 if let Ok(s) = CString::new(data) {
@@ -351,7 +351,7 @@ pub extern "C" fn junkfs_ll_rename(
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
     let newname = unsafe { CStr::from_ptr(newname) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.rename(parent as u64, &name, newparent as u64, &newname) {
+    match fs.rename(parent, &name, newparent, &newname) {
         Ok(_) => unsafe { reply_err(req, 0) },
         Err(e) => unsafe { reply_err(req, e) },
     }
@@ -370,10 +370,10 @@ pub extern "C" fn junkfs_ll_link(
     }
     let newname = unsafe { CStr::from_ptr(newname) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.meta().link(ino as u64, newparent as u64, &newname) {
+    match fs.meta().link(ino, newparent, &newname) {
         Ok(inode) => {
             let mut e = inode_to_entry(&inode);
-            unsafe { fuse::fuse_reply_entry(req, &mut e) };
+            unsafe { fuse::fuse_reply_entry(req, &e) };
         }
         Err(e) => unsafe { reply_err(req, e) },
     }
@@ -388,13 +388,13 @@ pub extern "C" fn junkfs_ll_open(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t, f
     let fs = unsafe { fs_from_req(req) };
     let flags = unsafe { (*fi).flags };
     if (flags & libc::O_TRUNC) != 0 {
-        let Some(mut inode) = fs.meta().load_inode(ino as u64) else {
+        let Some(mut inode) = fs.meta().load_inode(ino) else {
             unsafe { reply_err(req, ENOENT) };
             return;
         };
         if inode.length > 0 {
-            fs.flush_open_file_handles(ino as u64);
-            if let Err(e) = FileStore::set_len(ino as u64, 0) {
+            fs.flush_open_file_handles(ino);
+            if let Err(e) = FileStore::set_len(ino, 0) {
                 log::error!("open truncate set_len fail ino {} error {}", ino, e);
                 unsafe { reply_err(req, EFAULT) };
                 return;
@@ -410,7 +410,7 @@ pub extern "C" fn junkfs_ll_open(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t, f
             }
         }
     }
-    if let Some(h) = fs.new_file_handle(ino as u64) {
+    if let Some(h) = fs.new_file_handle(ino) {
         let fh = h.lock().unwrap().fh;
         unsafe {
             (*fi).fh = fh;
@@ -434,10 +434,10 @@ pub extern "C" fn junkfs_ll_read(
         return;
     }
     let fs = unsafe { fs_from_req(req) };
-    let fh = unsafe { (*fi).fh } as u64;
+    let fh = unsafe { (*fi).fh };
     if let Some(h) = fs.find_file_handle(fh) {
         let mut f = h.lock().unwrap();
-        if f.ino != ino as u64 {
+        if f.ino != ino {
             log::error!("read fh ino mismatch req_ino {} handle_ino {} fh {}", ino, f.ino, fh);
             unsafe { reply_err(req, EIO) };
             return;
@@ -490,11 +490,11 @@ pub extern "C" fn junkfs_ll_write(
         return;
     }
     let fs = unsafe { fs_from_req(req) };
-    let fh = unsafe { (*fi).fh } as u64;
+    let fh = unsafe { (*fi).fh };
     if let Some(h) = fs.find_file_handle(fh) {
         {
             let f = h.lock().unwrap();
-            if f.ino != ino as u64 {
+            if f.ino != ino {
                 log::error!("write fh ino mismatch req_ino {} handle_ino {} fh {}", ino, f.ino, fh);
                 unsafe { reply_err(req, EIO) };
                 return;
@@ -527,7 +527,7 @@ pub extern "C" fn junkfs_ll_write(
         if total > 0 {
             if let Err(e) = fs
                 .meta()
-                .update_inode_after_write(ino as u64, off as u64 + total as u64)
+                .update_inode_after_write(ino, off as u64 + total as u64)
             {
                 log::error!(
                     "write update inode fail ino {} off {} size {} error {}",
@@ -540,7 +540,7 @@ pub extern "C" fn junkfs_ll_write(
                 return;
             }
         }
-        unsafe { fuse::fuse_reply_write(req, total as usize) };
+        unsafe { fuse::fuse_reply_write(req, total) };
     } else {
         log::error!("write missing handle ino {} off {} size {} fh {}", ino, off, size, fh);
         unsafe { reply_err(req, ENOENT) };
@@ -559,7 +559,7 @@ pub extern "C" fn junkfs_ll_release(req: fuse::fuse_req_t, _ino: fuse::fuse_ino_
         return;
     }
     let fs = unsafe { fs_from_req(req) };
-    let fh = unsafe { (*fi).fh } as u64;
+    let fh = unsafe { (*fi).fh };
     fs.remove_file_handle(fh);
     unsafe { reply_err(req, 0) };
 }
@@ -573,7 +573,7 @@ pub extern "C" fn junkfs_ll_opendir(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t
     let fs = unsafe { fs_from_req(req) };
     if let Some(h) = fs.new_dir_handle_alloc() {
         let fh = h.lock().unwrap().fh;
-        fs.meta().load_dentry(ino as u64, &mut h.lock().unwrap());
+        fs.meta().load_dentry(ino, &mut h.lock().unwrap());
         unsafe {
             (*fi).fh = fh;
             fuse::fuse_reply_open(req, fi);
@@ -596,7 +596,7 @@ pub extern "C" fn junkfs_ll_readdir(
         return;
     }
     let fs = unsafe { fs_from_req(req) };
-    let fh = unsafe { (*fi).fh } as u64;
+    let fh = unsafe { (*fi).fh };
     let Some(h) = fs.find_dir_handle(fh) else {
         unsafe { reply_err(req, ENOENT) };
         return;
@@ -621,7 +621,7 @@ pub extern "C" fn junkfs_ll_readdir(
             fuse::fuse_add_direntry(
                 req,
                 buf.as_mut_ptr().add(used) as *mut c_char,
-                (size - used) as usize,
+                ((size - used)),
                 name.as_ptr(),
                 &st,
                 next_off,
@@ -645,7 +645,7 @@ pub extern "C" fn junkfs_ll_releasedir(req: fuse::fuse_req_t, _ino: fuse::fuse_i
         return;
     }
     let fs = unsafe { fs_from_req(req) };
-    let fh = unsafe { (*fi).fh } as u64;
+    let fh = unsafe { (*fi).fh };
     fs.remove_dir_handle(fh);
     unsafe { reply_err(req, 0) };
 }
@@ -658,9 +658,9 @@ pub extern "C" fn junkfs_ll_fsync(
     fi: *mut fuse::fuse_file_info,
 ) {
     let fs = unsafe { fs_from_req(req) };
-    if let Some(h) = if fi.is_null() { None } else { fs.find_file_handle(unsafe { (*fi).fh } as u64) } {
+    if let Some(h) = if fi.is_null() { None } else { fs.find_file_handle(unsafe { (*fi).fh }) } {
         let mut f = h.lock().unwrap();
-        if f.ino != ino as u64 {
+        if f.ino != ino {
             log::error!(
                 "fsync fh ino mismatch req_ino {} handle_ino {} fh {}",
                 ino,
@@ -673,13 +673,13 @@ pub extern "C" fn junkfs_ll_fsync(
         f.flush(false);
     }
     let datasync = datasync != 0;
-    if let Err(e) = FileStore::fsync(ino as u64, datasync) {
+    if let Err(e) = FileStore::fsync(ino, datasync) {
         log::error!("can't fsync ino {} error {}", ino, e);
         unsafe { reply_err(req, EFAULT) };
         return;
     }
     if datasync {
-        if let Err(e) = fs.meta().flush_inode(ino as u64) {
+        if let Err(e) = fs.meta().flush_inode(ino) {
             log::error!("can't sync inode {} error {}", ino, e);
             unsafe { reply_err(req, EFAULT) };
             return;
@@ -727,7 +727,7 @@ pub extern "C" fn junkfs_ll_create(
     }
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
     let fs = unsafe { fs_from_req(req) };
-    match fs.meta().mknod(parent as u64, &name, Itype::File, mode as u32) {
+    match fs.meta().mknod(parent, &name, Itype::File, mode) {
         Err(e) => unsafe { reply_err(req, e) },
         Ok(inode) => {
             let existed = FileStore::exists(inode.id);
@@ -745,7 +745,7 @@ pub extern "C" fn junkfs_ll_create(
                 unsafe {
                     (*fi).fh = fh;
                     let mut e = inode_to_entry(&inode);
-                    fuse::fuse_reply_create(req, &mut e, fi);
+                    fuse::fuse_reply_create(req, &e, fi);
                 }
             } else {
                 unsafe { reply_err(req, EFAULT) };

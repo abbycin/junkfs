@@ -9,7 +9,7 @@ pub struct BitMap64 {
 
 impl BitMap64 {
     pub fn new(cnt: u64) -> Self {
-        let words = if cnt == 0 { 0 } else { (cnt + 63) / 64 };
+        let words = if cnt == 0 { 0 } else { cnt.div_ceil(64) };
         Self {
             data: vec![0u64; words as usize],
             size: cnt,
