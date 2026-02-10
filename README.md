@@ -1,86 +1,91 @@
-## A toy filesystem based on FUSE (It has now become a testing tool for [Mace](https://github.com/abbycin/mace))
+# junkfs
 
-supported operations:
+一个基于 **libfuse3 low-level C API** 的 Rust 实验型文件系统。  
+它最初是 FUSE 练习项目，目前主要作为 `mace` 元数据引擎的测试载体。
 
-- `create`
-- `mknod`
-- `open`
-- `release`
-- `unlink`
-- `mkdir`
-- `opendir`
-- `readdir`
-- `rmdir`
-- `releasedir`
-- `read`
-- `write`
+详细设计见：`docs/design.md`
+
+## 特性概览
+
+- FUSE 多线程会话循环（`fuse_session_loop_mt`）
+- 元数据存储：`mace-kv`
+- 数据存储：每 inode 一个数据文件，按两级目录分片
+- writeback 数据路径 + 后台写回线程
+- 支持 open 文件延迟删除（更接近 Linux 语义）
+
+## 依赖
+
+- Linux
+- `fuse3` 运行库与开发头文件（例如 `fuse3`, `fuse3-devel` / `libfuse3-dev`）
+- 可访问的挂载点目录
+
+## 已实现的主要操作
+
 - `lookup`
-- `getattr`
-- `setattr`
+- `getattr` / `setattr`
+- `create` / `mknod` / `open` / `release`
+- `read` / `write` / `flush`
+- `mkdir` / `opendir` / `readdir` / `releasedir`
+- `unlink` / `rmdir` / `rename`
+- `link` / `symlink` / `readlink`
+- `fsync` / `fsyncdir`
 
-**NOTE**: This is not fully POSIX compliant, as fully implementing POSIX semantics is tedious and complex
+> 注意：这是实验型文件系统，不追求完整 POSIX 兼容。
 
-## How to use
+## 快速开始
 
-This project now uses **libfuse3 low-level C API** with a multi-threaded session loop.
+### 1) 格式化
 
-format
-
-```bash
-$ cargo run --bin mkfs /tmp/meta /tmp/data                                                                                           0 [12:12:58]
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s
-     Running `target/debug/mkfs /tmp/meta /tmp/data`
-formated meta_path => /tmp/meta store_path => /tmp/data
-```
-
-mount to `~/jfs`
+`mkfs` 会清空并重建 `meta_path` 与 `store_path`。
 
 ```bash
-$ mkdir ~/jfs
-$ cargo run --bin junkfs /tmp/meta ~/jfs                                                                                             0 [12:13:35]
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s
-     Running `target/debug/junkfs /tmp/meta /home/abby/jfs`
-log write to /tmp/junkfs.log
+cargo run --bin mkfs --release -- /nvme/meta /nvme/store
 ```
 
-in other terminal
+### 2) 挂载
 
 ```bash
-$ cat > x.c                                                                                                                          0 [12:14:06]
-#include <stdio.h>
-
-int main() {
-        printf("hello world!\n");
-}
-$ cc x.c
-$ ./a.out                                                                                                                            0 [12:14:50]
-hello world!
-$ stat a.out                                                                                                                         0 [12:14:52]
-  File: a.out
-  Size: 19832           Blocks: 1          IO Block: 4096   regular file
-Device: 0,42    Inode: 3           Links: 1
-Access: (0755/-rwxr-xr-x)  Uid: ( 1000/    abby)   Gid: ( 1000/    abby)
-Access: 2024-06-02 12:14:50.000000000 +0800
-Modify: 2024-06-02 12:14:50.000000000 +0800
-Change: 2024-06-02 12:14:50.000000000 +0800
- Birth: -
-$ stat x.c                                                                                                                           0 [12:14:56]
-  File: x.c
-  Size: 62              Blocks: 1          IO Block: 4096   regular file
-Device: 0,42    Inode: 2           Links: 1
-Access: (0644/-rw-r--r--)  Uid: ( 1000/    abby)   Gid: ( 1000/    abby)
-Access: 2024-06-02 12:14:26.000000000 +0800
-Modify: 2024-06-02 12:14:26.000000000 +0800
-Change: 2024-06-02 12:14:26.000000000 +0800
- Birth: -
-$ ls -li                                                                                                                             0 [12:19:18]
-total 1
-3 -rwxr-xr-x 1 abby abby 19832 Jun  2 12:14 a.out*
-2 -rw-r--r-- 1 abby abby    62 Jun  2 12:14 x.c
+mkdir -p ~/jfs
+cargo run --bin junkfs --release -- /nvme/meta ~/jfs
 ```
 
-umount, also notify `junkfs` to quit
+默认日志输出到 `/tmp/junkfs.log`。
+
+### 3) 使用
+
+在另一个终端对 `~/jfs` 正常执行文件操作即可，例如：
 
 ```bash
-$ umount ~/jfs
+tar xf /home/neo/Downloads/linux-6.12.69.tar.xz -C ~/jfs
+cd ~/jfs/linux-6.12.69
+make alldefconfig
+make -j4
 ```
+
+### 4) 卸载
+
+```bash
+umount ~/jfs
+```
+
+## 常用环境变量
+
+- `JUNK_LEVEL`：日志级别，默认 `ERROR`
+- `JUNK_DISABLE_WBC=1`：关闭 FUSE writeback cache（默认开启）
+- `JUNK_ENABLE_INO_REUSE=0|1`：控制 inode 复用（默认 `1`）
+- `JUNK_STRICT_INVARIANT=1`：开启严格一致性断言（默认关闭）
+- `JUNK_VERIFY_FLUSH=1`：开启写后校验（调试用，默认关闭）
+
+## stats 统计（可选）
+
+可通过 feature 打开写入统计日志：
+
+```bash
+cargo run --bin junkfs --release --features stats -- /nvme/meta ~/jfs
+```
+
+## 已知限制
+
+- 默认 writeback 策略偏性能，崩溃一致性依赖 `fsync/fsyncdir`
+- 元数据后端固定为 `mace-kv`
+- 面向测试与实验，不建议作为生产文件系统直接使用

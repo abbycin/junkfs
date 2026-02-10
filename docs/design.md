@@ -1,21 +1,28 @@
-这是一个`Rust`和`FUSE`的练习项目，目前基于`libfuse3`低层`C API`实现多线程挂载，并实现数个常用的`POSIX`文件操作方法，这里介绍`junkfs`的设计
+这是一个 Rust + FUSE 的实验型文件系统实现。当前版本基于 `libfuse3` 低层 C API（非 fuser），采用多线程会话循环，元数据存放在 `mace`，文件数据存放在本地分片目录中的普通文件。
 
-### 元数据设计
+## 1. 总体架构
 
-在`junkfs`中，元数据序列化后存在`kvdb`中（~~使用`sled`实现~~ 使用 `mace` 实现），因此在格式化时需要提供 `kvdb`的存储路径，同时`junkfs`
-旨在做本地的文件系统，因此，在格式化时还需要将数据存储路径写入到元数据中
+`junkfs` 的核心路径如下：
 
-在`junkfs`中，元数据分为
+1. Linux VFS 通过 FUSE 请求进入 `junkfs_ll_*`
+2. `Fs` 负责文件句柄/目录句柄、inode 引用计数、写回线程调度
+3. `Meta` 负责 inode/dentry/superblock/imap 的事务提交
+4. `FileStore` 负责实际数据文件读写（`pwritev/pwrite`）
 
-1. `SuperBlock`
-1. `Dentry`
-2. `Inode`
+写入是典型 writeback 模式：先入缓存，再由后台线程批量刷盘与提交元数据。
 
-#### SuperBlock
+## 2. 元数据设计
 
-由于使用了`kvdb`在`superblock`中可以将`dentry`剥离出来，由于`dentry`是一种特殊的文件，因此也会占有`inode`
-，因此在`superblock`中只保留基础参数与数据存储路径，`inode`空闲管理采用**分组位图**，单独存放在`kvdb`中，
-以降低写放大与读放大。`superblock`结构如下
+元数据按 key-value 形式存放在 `mace` bucket 中，核心对象为：
+
+- `SuperBlock`
+- `Inode`
+- `Dentry`
+- `imap`（分组 inode 位图）
+
+### 2.1 SuperBlock
+
+`superblock` 只保存全局基础信息，不保存 inode table/data map：
 
 ```rust
 struct SuperBlock {
@@ -28,140 +35,128 @@ struct SuperBlock {
 }
 ```
 
-`inode`分配位图由两个层次构成：
+当前 `version = 3`。`uri` 是数据文件根目录路径。
 
-- `imap_sum`：每个 group 一个 bit，表示该组是否还有空闲 inode
-- `imap_$gid`：每个 group 内的具体位图，按需加载
+### 2.2 Inode / Dentry
 
-这样可以避免每次分配/释放都修改整个大位图。
+- inode key: `i_$ino`
+- dentry key: `d_$parent_$name`
 
-#### Dentry
+`Itype` 当前支持：
 
-和大多数文件系统一样，在`junkfs`中`dentry`也用于存放名字到`inode`的映射，但是在`junkfs`中`dentry`是平坦的存放在`kvdb`
-中，一个目录中文件的表示为 `d_$ino_$name`，其中`$ino`是目录的`inode`编号，而`$name`是目录中文件的名字，`dentry`的结构如下
+- `File`
+- `Dir`
+- `Symlink`
 
-```rust
-struct Dentry {
-    parent: Ino, // 目录的inode
-    ino: Ino,    // 文件自己的inode
-    name: String,
-}
-```
+### 2.3 inode 分配位图（imap）
 
-#### Inode
+inode 分配采用两层位图：
 
-和`dentry`一样，`inode`也是平坦的存放在`kvdb`中，一个文件的表示为`i_$ino`，其中`$ino`是这个文件的`inode`编号，`inode`的结构如下
+- `imap_sum`：每个组 1 bit，表示该组是否仍有空闲 inode
+- `imap_$gid`：组内 bitset，表示具体 inode 占用
 
-```rust
-struct Inode {
-    pub id: Ino,
-    pub parent: Ino,
-    pub kind: Itype,
-    pub mode: u16,
-    pub uid: u32,
-    pub gid: u32,
-    pub atime: u64,
-    pub mtime: u64,
-    pub ctime: u64,
-    pub length: u64,
-    pub links: u32,
-}
+分配/释放时按需加载 group，避免全量位图读写。
 
-pub enum Itype {
-    File,
-    Dir,
-}
-```
+### 2.4 pending 提交模型
 
-在`junkfs`中仅支持两种类型的文件：普通文件、目录
+元数据变更先写入内存 `pending`：
 
-### 数据设计
+- `puts: HashMap<String, Vec<u8>>`
+- `dels: HashSet<String>`
 
-在`junkfs`中，数据按固定块大小进行逻辑划分，但物理存储改为**每个 inode 对应一个数据文件**，以避免大量目录与小文件导致的元数据膨胀。文件存储路径采用两级分片目录：
+后台线程按阈值/时间触发 `commit_pending()` 批量提交事务。提交过程采用“取走批次再提交”的方式，避免大 value 在重试路径上反复 clone，降低峰值内存。
 
-```
+### 2.5 open 文件的延迟删除
+
+为对齐 Linux 语义，`unlink/rename` 覆盖目标时对“仍被打开的普通文件”采用延迟回收：
+
+1. 先删除目录项（对用户不可见）
+2. inode 链接数到 0 后加入 `orphan_inodes`
+3. 最后一个 file handle release 时执行 `finalize_unlink`
+4. 最终删除数据文件
+
+这样可以保证“已打开 fd 在 unlink 后仍可继续访问”。
+
+## 3. 数据设计
+
+### 3.1 存储布局
+
+每个 inode 对应一个数据文件，路径为：
+
+```text
 $store_path/<shard1>/<shard2>/<ino>
 ```
 
-其中`shard1`和`shard2`来自`ino`的低位切分，用于控制单目录的目录项数量。数据文件是**稀疏文件**，逻辑块通过固定偏移映射到数据文件：
+通过两级目录分片控制单目录项数量。数据文件是稀疏文件，逻辑偏移直接映射到物理偏移。
 
-```
-offset = block_id * FS_BLK_SIZE + block_off
-```
+### 3.2 数据缓存与刷写
 
-这样既保留块语义（用于缓存与 I/O 拆分），又避免为每个块创建文件。`truncate` 会调用 `set_len` 更新数据文件长度，扩展部分读零，缩小后不会读到旧数据。
+`CacheStore` 使用页缓存（来自 `MemPool`）进行 writeback：
 
-NOTE: 最好使用 XFS 这类动态分配 inode 的文件系统做数据存储
+- 默认 mempool: `256MB`
+- 脏数据阈值刷写: `64MB`
+- 超时刷写: `200ms`
+- 大写优化：当写请求满足“对齐且足够大”时走 direct write 路径，绕过页缓存
 
-#### 数据一致性与 fsync 语义
+后台写回线程每 `100ms` 扫描缓存并刷盘，同时推动元数据提交。
 
-`junkfs`采用**写回(writeback)**策略：数据与元数据会先进入内存缓存，由后台线程周期性刷盘并批量提交元数据。
-因此在**没有显式 fsync** 的情况下，崩溃一致性弱于传统的严格同步方案，但性能更高。
+### 3.3 文件写入后的页缓存控制
 
-`fsync` 语义区分如下：
+`FileStore` 在完成数据写入后会调用 `posix_fadvise(..., POSIX_FADV_DONTNEED)` 尝试丢弃刚写入的数据页缓存，减少 FUSE 场景下内核缓存放大。
 
-- `fsync(datasync=true)`：先刷数据缓存，再 `sync_data`，随后写回该 inode 元数据并提交 pending 事务
-- `fsync(datasync=false)`：先刷数据缓存，再 `sync_all`，随后 `meta.sync()`（写回 inode/imap/sb 并提交 pending）
-- `fsyncdir`：仅同步元数据（`meta.sync()`）
+## 4. FUSE 接入
 
-为了降低开销，**数据文件创建/删除不再对父目录 `fsync`**，这一点偏向性能而非强一致语义。
+当前接入方式：
 
-#### 文件抽象
-
-在`junkfs`中也有类似于内核中的`struct file`结构，这个结构就是`FileHandle`，它包含一个全局唯一的`id`
-，在文件打开时分配，关闭时释放，一个文件可以打开多次，因此存在一个`inode`对应多个`FileHandle`的情况
-
-在`FileHandle`中实现了`read`、`write`和`flush`功能，这样是对照`struct file`设计的，`Inode`负责结构管理，`FileHandle`负责内容管理
-
-#### 目录抽象
-
-在`junkfs`中目录和文件是独立的实现，但它们都实现了一个比较的`trait`，这样它们就可以存放在同一个以`ino`
-为`key`，`Box<dyn Trait>`为值的表中，统一资源管理。同样，和`FileHandle`一样，目录结构`DirHandle`中也有一个全局唯一的`id`
-，这个结构的作用是：在列出目录内容时保证原子性。即在打开目录时，将目录内容读取出来，在列出内容时向外吐出读取的目录项，这样可以避免当目录在读取同时又有新建或删除操作在目录下进行，导致列出的目录项出现重复或者丢失乱序等问题（这也是`POSIX`
-设计的问题）
-
-### 缓存
-
-在`junkfs`中有两类缓存：1. 元数据缓存，2. 数据缓存
-
-##### 元数据缓存
-
-当前实现包含轻量级元数据缓存与索引：
-
-- `inode`缓存：读缓存 + dirty 标记，写回由后台线程或 `fsync` 触发，dirty inode 通过集合追踪以避免全表扫描
-- `dentry` LRU：缓存目录项存在性与 inode 号，减少 `kvdb` 读取
-- `dir_index`：按目录维护 `name -> ino` 的哈希索引，首次 `readdir/lookup` 时从 `kvdb` 扫描构建，并与 pending 变更合并
-
-这套缓存不会改变持久化语义，只是减少查询路径上的随机读。
-
-##### 数据缓存
-
-数据缓存使用固定大小的页面组成，在设计上，当缓存不足时将缓存刷到文件中，或在刷写超时后刷到文件。当前实现不再要求在 `close/read` 前强制刷盘，而是由后台线程周期性写回。
-当前实现已引入**后台写回线程**，以实现周期性 flush：
-
-- 数据写入先进入 `CacheStore`（`MemPool` 页缓存），写回条件：缓存超过阈值或超时
-- 后台线程定期 flush 缓存，并批量提交元数据
-- 对于**大块且对齐的写入**，会走直接写路径（pwrite），绕过缓存，降低拷贝与页管理开销
-- FUSE 挂载启用 `writeback_cache` 与 `async_read`，并在 `init` 中将 `max_write/max_read/max_readahead` 提升到 16MB
-
-因此数据缓存不再是纯“写穿”策略，而是典型的 writeback 模式。
-
-### FUSE 接入
-
-当前使用 `libfuse3` 低层 `C API`：
-
-- `fuse_session_loop_mt` 多线程模型
+- `libfuse3` low-level C API
+- `fuse_session_loop_mt` 多线程循环
 - `max_write/max_read/max_readahead = 16MB`
-- 启用 `writeback_cache` 与 `async_read`
-- `lookup` miss 使用负向 entry 缓存，按 `entry_timeout` 做短期缓存
+- 启用 `async_read`
+- 默认启用 `writeback_cache`（可用 `JUNK_DISABLE_WBC=1` 关闭）
+- lookup miss 使用 negative entry 缓存（短 TTL）
 
-### 元数据引擎
+## 5. 一致性语义
 
-~~在`junkfs`中，目前仅使用了`sled`作为元数据存储引擎，但在实现时考虑了扩展性，其他的引擎只需要实现`MetaStore`
-trait即可替换掉`sled`，存储引擎只需要提供`key-value`接口即可，比如存储引擎为关系式数据库，那么对于`ls`
-命令，可能的操作是 `select * from dentry_table where dentry_name like 'd_233_%'`~~
+### 5.1 fsync 语义
 
-目前已经改为使用 `mace` 作为元数据引擎，并且不考虑扩展。所有元数据存放在固定 bucket 中，
-`mknod/unlink/rename/link` 等操作会**先写入 pending 缓冲**，再由后台线程或 `fsync` 批量提交。
-`commit_pending` 内部使用单事务提交多个 key，确保这批更新的原子性。后台线程按**阈值或时间间隔**
-提交（默认阈值约 8K key、间隔 200ms），以减少事务开销。dirty inode 采用集合追踪，仅写回需要的 inode。
+- `fsync(datasync=true)`：
+  - 刷 file handle 缓存
+  - `FileStore::fsync(datasync=true)`
+  - `flush_inode(ino)` + `commit_pending()`
+- `fsync(datasync=false)`：
+  - 刷 file handle 缓存
+  - `FileStore::fsync(datasync=false)`
+  - `meta.sync()`
+- `fsyncdir`：走 `meta.sync()`
+
+### 5.2 崩溃模型
+
+默认是性能优先的 writeback：不保证每次系统调用返回后都已持久化。需要更强语义时依赖 `fsync/fsyncdir`。
+
+## 6. 内存占用策略
+
+当前默认内存上限主要来自三部分：
+
+1. `MemPool`: `256MB`
+2. `mace` 元数据缓存:
+   - `cache_capacity = 256MB`
+   - `cache_count/stat_mask_cache_count = 4096`
+   - `data/blob handle cache = 64`
+3. 进程运行时对象与索引（handle map、dentry/index 缓存、pending 等）
+
+整体目标是将进程内存保持在可控区间，同时把更多瞬时占用留给 Linux 页缓存。
+
+## 7. 可观测性与调试
+
+- `JUNK_LEVEL`：日志级别（默认 `ERROR`）
+- `JUNK_DISABLE_WBC`：关闭 FUSE writeback cache
+- `JUNK_ENABLE_INO_REUSE`：是否开启 inode 复用（默认开）
+- `JUNK_STRICT_INVARIANT`：开启严格一致性断言（默认关）
+- `JUNK_VERIFY_FLUSH`：写后校验（调试用，默认关）
+- `stats` feature：输出写入/flush 统计
+
+## 8. 当前已知边界
+
+- 这是测试/实验型文件系统，不追求完整 POSIX 兼容
+- 元数据依赖 `mace`，不再设计多后端抽象
+- writeback 模式下崩溃一致性弱于严格同步文件系统
