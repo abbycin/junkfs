@@ -457,30 +457,45 @@ impl Meta {
             self.pending_free.lock().unwrap().clear();
             return;
         }
-        let ready = {
+        let pending_snapshot = {
             let pending = self.pending.lock().unwrap();
-            let mut frees = self.pending_free.lock().unwrap();
-            if frees.is_empty() {
-                return;
+            if pending.puts.is_empty() && pending.dels.is_empty() {
+                None
+            } else {
+                Some((
+                    pending.puts.keys().cloned().collect::<HashSet<_>>(),
+                    pending.dels.clone(),
+                ))
             }
-            let mut ready = Vec::new();
-            let mut keep = Vec::new();
+        };
+        let mut frees = self.pending_free.lock().unwrap();
+        if frees.is_empty() {
+            return;
+        }
+        let mut ready = Vec::new();
+        let mut keep = Vec::new();
+        if let Some((pending_puts, pending_dels)) = pending_snapshot {
             for ino in frees.drain(..) {
                 let key = Inode::key(ino);
-                if pending.dels.contains(&key) || pending.puts.contains_key(&key) {
+                if pending_dels.contains(&key) || pending_puts.contains(&key) {
                     keep.push(ino);
                 } else {
                     ready.push(ino);
                 }
             }
-            *frees = keep;
-            ready
-        };
+        } else {
+            ready.extend(frees.drain(..));
+        }
+        *frees = keep;
+        drop(frees);
         if ready.is_empty() {
             return;
         }
         let meta = &self.meta;
         let mut retry = Vec::new();
+        let mut touched_gids = HashSet::new();
+        let mut summary_val = None;
+        let mut group_vals = Vec::new();
         {
             let mut state = self.state.lock().unwrap();
             for ino in ready {
@@ -500,11 +515,22 @@ impl Meta {
                         continue;
                     }
                 };
-                let summary_val = plan.summary_val();
-                let group_val = plan.group_val();
                 let gid = plan.gid;
                 state.imap.apply_free(plan);
-                self.stage_put(InoMap::summary_key(), summary_val);
+                touched_gids.insert(gid);
+            }
+            if !touched_gids.is_empty() {
+                summary_val = Some(state.imap.summary_val());
+                let mut gids = touched_gids.iter().copied().collect::<Vec<_>>();
+                gids.sort_unstable();
+                for gid in gids {
+                    group_vals.push((gid, state.imap.group_val(gid)));
+                }
+            }
+        }
+        if let Some(summary_val) = summary_val {
+            self.stage_put(InoMap::summary_key(), summary_val);
+            for (gid, group_val) in group_vals {
                 self.stage_put(InoMap::group_key(gid), group_val);
             }
         }
@@ -520,7 +546,14 @@ impl Meta {
             let (puts, dels) = {
                 let pending = self.pending.lock().unwrap();
                 if pending.puts.is_empty() && pending.dels.is_empty() {
-                    return Ok(());
+                    drop(pending);
+                    self.apply_pending_frees();
+                    let pending = self.pending.lock().unwrap();
+                    if pending.puts.is_empty() && pending.dels.is_empty() {
+                        return Ok(());
+                    }
+                    drop(pending);
+                    continue;
                 }
                 let mut puts = Vec::new();
                 let mut bytes = 0usize;
@@ -562,23 +595,20 @@ impl Meta {
             let res = self.commit_pending_batch(&puts, &dels);
             match res {
                 Ok(()) => {
-                    {
-                        let mut pending = self.pending.lock().unwrap();
-                        for (k, v) in puts {
-                            if let Some(cur) = pending.puts.get(&k) {
-                                if *cur == v {
-                                    pending.puts.remove(&k);
-                                }
+                    let mut pending = self.pending.lock().unwrap();
+                    for (k, v) in puts {
+                        if let Some(cur) = pending.puts.get(&k) {
+                            if *cur == v {
+                                pending.puts.remove(&k);
                             }
                         }
-                        for k in dels {
-                            if pending.dels.contains(&k) && !pending.puts.contains_key(&k) {
-                                pending.dels.remove(&k);
-                            }
-                        }
-                        batch_limit = PENDING_COMMIT_BATCH;
                     }
-                    self.apply_pending_frees();
+                    for k in dels {
+                        if pending.dels.contains(&k) && !pending.puts.contains_key(&k) {
+                            pending.dels.remove(&k);
+                        }
+                    }
+                    batch_limit = PENDING_COMMIT_BATCH;
                 }
                 Err(OpCode::AbortTx) => {
                     if batch_limit <= 1 {
@@ -899,24 +929,35 @@ impl Meta {
 
         let meta = &self.meta;
         let mut state = self.state.lock().unwrap();
-        let plan = state
+        let mut plan = state
             .imap
             .alloc_plan(&mut |gid| Self::load_imap_group(meta, gid))
-            .map_err(|_| EFAULT)?
-            .ok_or(ENOENT)?;
+            .map_err(|_| EFAULT)?;
+        if plan.is_none() {
+            drop(state);
+            self.apply_pending_frees();
+            state = self.state.lock().unwrap();
+            plan = state
+                .imap
+                .alloc_plan(&mut |gid| Self::load_imap_group(meta, gid))
+                .map_err(|_| EFAULT)?;
+        }
+        let plan = plan.ok_or(ENOENT)?;
         let ino = plan.ino;
-        let liveness = self.inode_liveness(ino);
-        if Self::strict_invariant_enabled() && !matches!(liveness, InodeLiveness::Missing) {
-            let inode = self.load_inode(ino);
-            let live_dentry = self.inode_has_live_dentry(ino);
-            log::error!(
-                "invariant violated alloc inode {} liveness {:?} inode {:?} live_dentry {}",
-                ino,
-                liveness,
-                inode,
-                live_dentry
-            );
-            panic!("alloc reused live inode");
+        if Self::strict_invariant_enabled() {
+            let liveness = self.inode_liveness(ino);
+            if !matches!(liveness, InodeLiveness::Missing) {
+                let inode = self.load_inode(ino);
+                let live_dentry = self.inode_has_live_dentry(ino);
+                log::error!(
+                    "invariant violated alloc inode {} liveness {:?} inode {:?} live_dentry {}",
+                    ino,
+                    liveness,
+                    inode,
+                    live_dentry
+                );
+                panic!("alloc reused live inode");
+            }
         }
         self.clear_inode_deleting(ino);
 
@@ -969,41 +1010,6 @@ impl Meta {
             self.stage_del(dkey);
             self.cache_put(inode, false);
             return Ok(inode);
-        }
-
-        if Self::inode_reuse_enabled() {
-            let meta = &self.meta;
-            let plan = {
-                let mut state = self.state.lock().unwrap();
-                match state
-                    .imap
-                    .free_plan(inode.id, &mut |gid| Self::load_imap_group(meta, gid))
-                {
-                    Ok(Some(plan)) => plan,
-                    Ok(None) => {
-                        log::error!(
-                            "imap free_plan none ino {} parent {} name {} kind {:?} links {}",
-                            inode.id,
-                            parent,
-                            name,
-                            inode.kind,
-                            inode.links
-                        );
-                        return Err(EFAULT);
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "imap free_plan error ino {} parent {} name {} err {}",
-                            inode.id,
-                            parent,
-                            name,
-                            e
-                        );
-                        return Err(EFAULT);
-                    }
-                }
-            };
-            debug_assert_eq!(plan.ino, inode.id);
         }
 
         self.mark_inode_deleting(inode.id);
@@ -1061,27 +1067,6 @@ impl Meta {
         };
         if inode.links != 0 {
             return Ok(());
-        }
-        if Self::inode_reuse_enabled() {
-            let meta = &self.meta;
-            let plan = {
-                let mut state = self.state.lock().unwrap();
-                match state
-                    .imap
-                    .free_plan(inode.id, &mut |gid| Self::load_imap_group(meta, gid))
-                {
-                    Ok(Some(plan)) => plan,
-                    Ok(None) => {
-                        log::error!("imap free_plan none ino {} finalize", inode.id);
-                        return Err(EFAULT);
-                    }
-                    Err(e) => {
-                        log::error!("imap free_plan error ino {} finalize err {}", inode.id, e);
-                        return Err(EFAULT);
-                    }
-                }
-            };
-            debug_assert_eq!(plan.ino, inode.id);
         }
 
         self.mark_inode_deleting(inode.id);

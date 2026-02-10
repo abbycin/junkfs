@@ -208,11 +208,11 @@ pub extern "C" fn junkfs_ll_mknod(
             let existed = FileStore::exists(inode.id);
             if existed {
                 log::error!("mknod reused data file ino {}", inode.id);
-            }
-            if let Err(e) = FileStore::set_len(inode.id, 0) {
-                log::error!("mknod set_len fail ino {} error {}", inode.id, e);
-                unsafe { reply_err(req, EFAULT) };
-                return;
+                if let Err(e) = FileStore::set_len(inode.id, 0) {
+                    log::error!("mknod set_len fail ino {} error {}", inode.id, e);
+                    unsafe { reply_err(req, EFAULT) };
+                    return;
+                }
             }
             let mut e = inode_to_entry(&inode);
             unsafe { fuse::fuse_reply_entry(req, &mut e) };
@@ -733,11 +733,11 @@ pub extern "C" fn junkfs_ll_create(
             let existed = FileStore::exists(inode.id);
             if existed {
                 log::error!("create reused data file ino {}", inode.id);
-            }
-            if let Err(e) = FileStore::set_len(inode.id, 0) {
-                log::error!("create set_len fail ino {} error {}", inode.id, e);
-                unsafe { reply_err(req, EFAULT) };
-                return;
+                if let Err(e) = FileStore::set_len(inode.id, 0) {
+                    log::error!("create set_len fail ino {} error {}", inode.id, e);
+                    unsafe { reply_err(req, EFAULT) };
+                    return;
+                }
             }
             let ino = inode.id;
             if let Some(handle) = fs.new_file_handle(ino) {

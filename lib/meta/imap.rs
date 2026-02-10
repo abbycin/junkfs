@@ -11,7 +11,6 @@ pub struct AllocPlan {
 }
 
 pub struct FreePlan {
-    pub ino: Ino,
     pub gid: u64,
     group: BitMap64,
     summary: BitMap64,
@@ -20,16 +19,6 @@ pub struct FreePlan {
 }
 
 impl AllocPlan {
-    pub fn summary_val(&self) -> Vec<u8> {
-        bincode::serialize(&self.summary).expect("can't serialize imap summary")
-    }
-
-    pub fn group_val(&self) -> Vec<u8> {
-        bincode::serialize(&self.group).expect("can't serialize imap group")
-    }
-}
-
-impl FreePlan {
     pub fn summary_val(&self) -> Vec<u8> {
         bincode::serialize(&self.summary).expect("can't serialize imap summary")
     }
@@ -218,7 +207,6 @@ impl InoMap {
             new_summary.set(gid);
         }
         Ok(Some(FreePlan {
-            ino,
             gid,
             group: new_group,
             summary: new_summary,
