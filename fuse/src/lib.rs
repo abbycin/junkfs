@@ -5,7 +5,7 @@ mod bindings {
 
 pub use bindings::*;
 
-extern "C" {
+unsafe extern "C" {
     pub fn junkfs_fuse_bridge_version() -> ::std::os::raw::c_int;
     pub fn junkfs_ll_ops_ptr() -> *const fuse_lowlevel_ops;
     pub fn junkfs_ll_ops_size() -> usize;

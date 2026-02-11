@@ -154,7 +154,7 @@ impl Meta {
         }
 
         let view = self.meta.view();
-        let mut it = view.seek("d_");
+        let it = view.seek("d_");
         for item in it {
             if !item.key().starts_with(b"d_") {
                 break;
@@ -682,7 +682,7 @@ impl Meta {
             return true;
         }
         let view = self.meta.view();
-        let mut it = view.seek(&prefix);
+        let it = view.seek(&prefix);
         for item in it {
             if !item.key().starts_with(prefix.as_bytes()) {
                 break;

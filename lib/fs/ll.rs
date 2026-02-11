@@ -13,20 +13,20 @@ const TTL_SEC: f64 = 5.0;
 const NEG_TTL_SEC: f64 = 5.0;
 
 unsafe fn fs_from_req(req: fuse::fuse_req_t) -> &'static Fs {
-    let ud = fuse::fuse_req_userdata(req) as *mut Fs;
-    &*ud
+    let ud = unsafe { fuse::fuse_req_userdata(req) } as *mut Fs;
+    unsafe { &*ud }
 }
 
 unsafe fn reply_err(req: fuse::fuse_req_t, err: i32) {
-    let _ = fuse::fuse_reply_err(req, err);
+    let _ = unsafe { fuse::fuse_reply_err(req, err) };
 }
 
 unsafe fn reply_negative(req: fuse::fuse_req_t) {
-    let mut e: fuse::fuse_entry_param = std::mem::zeroed();
+    let mut e: fuse::fuse_entry_param = unsafe { std::mem::zeroed() };
     e.ino = 0;
     e.attr_timeout = 0.0;
     e.entry_timeout = NEG_TTL_SEC;
-    let _ = fuse::fuse_reply_entry(req, &e);
+    let _ = unsafe { fuse::fuse_reply_entry(req, &e) };
 }
 
 fn kind_to_mode(kind: Itype) -> libc::mode_t {
@@ -66,7 +66,7 @@ fn inode_to_entry(inode: &Inode) -> fuse::fuse_entry_param {
     e
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_init(userdata: *mut c_void, conn: *mut fuse::fuse_conn_info) {
     let _ = userdata;
     if conn.is_null() {
@@ -86,12 +86,12 @@ pub extern "C" fn junkfs_ll_init(userdata: *mut c_void, conn: *mut fuse::fuse_co
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_destroy(userdata: *mut c_void) {
     let _ = userdata;
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_lookup(req: fuse::fuse_req_t, parent: fuse::fuse_ino_t, name: *const c_char) {
     if name.is_null() {
         unsafe { reply_err(req, ENOENT) };
@@ -101,14 +101,14 @@ pub extern "C" fn junkfs_ll_lookup(req: fuse::fuse_req_t, parent: fuse::fuse_ino
     let fs = unsafe { fs_from_req(req) };
     match fs.meta().lookup(parent, &name) {
         Some(inode) => {
-            let mut e = inode_to_entry(&inode);
+            let e = inode_to_entry(&inode);
             unsafe { fuse::fuse_reply_entry(req, &e) };
         }
         None => unsafe { reply_negative(req) },
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_getattr(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t, _fi: *mut fuse::fuse_file_info) {
     let fs = unsafe { fs_from_req(req) };
     match fs.meta().load_inode(ino) {
@@ -120,7 +120,7 @@ pub extern "C" fn junkfs_ll_getattr(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_setattr(
     req: fuse::fuse_req_t,
     ino: fuse::fuse_ino_t,
@@ -189,7 +189,7 @@ pub extern "C" fn junkfs_ll_setattr(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_mknod(
     req: fuse::fuse_req_t,
     parent: fuse::fuse_ino_t,
@@ -214,14 +214,14 @@ pub extern "C" fn junkfs_ll_mknod(
                     return;
                 }
             }
-            let mut e = inode_to_entry(&inode);
+            let e = inode_to_entry(&inode);
             unsafe { fuse::fuse_reply_entry(req, &e) };
         }
         Err(e) => unsafe { reply_err(req, e) },
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_mkdir(
     req: fuse::fuse_req_t,
     parent: fuse::fuse_ino_t,
@@ -236,14 +236,14 @@ pub extern "C" fn junkfs_ll_mkdir(
     let fs = unsafe { fs_from_req(req) };
     match fs.meta().mknod(parent, &name, Itype::Dir, mode) {
         Ok(inode) => {
-            let mut e = inode_to_entry(&inode);
+            let e = inode_to_entry(&inode);
             unsafe { fuse::fuse_reply_entry(req, &e) };
         }
         Err(e) => unsafe { reply_err(req, e) },
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_unlink(req: fuse::fuse_req_t, parent: fuse::fuse_ino_t, name: *const c_char) {
     if name.is_null() {
         unsafe { reply_err(req, ENOENT) };
@@ -262,7 +262,7 @@ pub extern "C" fn junkfs_ll_unlink(req: fuse::fuse_req_t, parent: fuse::fuse_ino
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_rmdir(req: fuse::fuse_req_t, parent: fuse::fuse_ino_t, name: *const c_char) {
     if name.is_null() {
         unsafe { reply_err(req, ENOENT) };
@@ -281,7 +281,7 @@ pub extern "C" fn junkfs_ll_rmdir(req: fuse::fuse_req_t, parent: fuse::fuse_ino_
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_symlink(
     req: fuse::fuse_req_t,
     link: *const c_char,
@@ -308,14 +308,14 @@ pub extern "C" fn junkfs_ll_symlink(
                 }
                 f.flush(false);
             }
-            let mut e = inode_to_entry(&inode);
+            let e = inode_to_entry(&inode);
             unsafe { fuse::fuse_reply_entry(req, &e) };
         }
         Err(e) => unsafe { reply_err(req, e) },
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_readlink(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t) {
     let fs = unsafe { fs_from_req(req) };
     if let Some(inode) = fs.meta().load_inode(ino) {
@@ -335,7 +335,7 @@ pub extern "C" fn junkfs_ll_readlink(req: fuse::fuse_req_t, ino: fuse::fuse_ino_
     unsafe { reply_err(req, EFAULT) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_rename(
     req: fuse::fuse_req_t,
     parent: fuse::fuse_ino_t,
@@ -357,7 +357,7 @@ pub extern "C" fn junkfs_ll_rename(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_link(
     req: fuse::fuse_req_t,
     ino: fuse::fuse_ino_t,
@@ -372,14 +372,14 @@ pub extern "C" fn junkfs_ll_link(
     let fs = unsafe { fs_from_req(req) };
     match fs.meta().link(ino, newparent, &newname) {
         Ok(inode) => {
-            let mut e = inode_to_entry(&inode);
+            let e = inode_to_entry(&inode);
             unsafe { fuse::fuse_reply_entry(req, &e) };
         }
         Err(e) => unsafe { reply_err(req, e) },
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_open(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t, fi: *mut fuse::fuse_file_info) {
     if fi.is_null() {
         unsafe { reply_err(req, EFAULT) };
@@ -421,7 +421,7 @@ pub extern "C" fn junkfs_ll_open(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t, f
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_read(
     req: fuse::fuse_req_t,
     ino: fuse::fuse_ino_t,
@@ -468,7 +468,7 @@ pub extern "C" fn junkfs_ll_read(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_write(
     req: fuse::fuse_req_t,
     ino: fuse::fuse_ino_t,
@@ -525,10 +525,7 @@ pub extern "C" fn junkfs_ll_write(
             retries = 0;
         }
         if total > 0 {
-            if let Err(e) = fs
-                .meta()
-                .update_inode_after_write(ino, off as u64 + total as u64)
-            {
+            if let Err(e) = fs.meta().update_inode_after_write(ino, off as u64 + total as u64) {
                 log::error!(
                     "write update inode fail ino {} off {} size {} error {}",
                     ino,
@@ -547,12 +544,12 @@ pub extern "C" fn junkfs_ll_write(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_flush(req: fuse::fuse_req_t, _ino: fuse::fuse_ino_t, _fi: *mut fuse::fuse_file_info) {
     unsafe { reply_err(req, 0) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_release(req: fuse::fuse_req_t, _ino: fuse::fuse_ino_t, fi: *mut fuse::fuse_file_info) {
     if fi.is_null() {
         unsafe { reply_err(req, EFAULT) };
@@ -564,7 +561,7 @@ pub extern "C" fn junkfs_ll_release(req: fuse::fuse_req_t, _ino: fuse::fuse_ino_
     unsafe { reply_err(req, 0) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_opendir(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t, fi: *mut fuse::fuse_file_info) {
     if fi.is_null() {
         unsafe { reply_err(req, EFAULT) };
@@ -583,7 +580,7 @@ pub extern "C" fn junkfs_ll_opendir(req: fuse::fuse_req_t, ino: fuse::fuse_ino_t
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_readdir(
     req: fuse::fuse_req_t,
     _ino: fuse::fuse_ino_t,
@@ -621,7 +618,7 @@ pub extern "C" fn junkfs_ll_readdir(
             fuse::fuse_add_direntry(
                 req,
                 buf.as_mut_ptr().add(used) as *mut c_char,
-                ((size - used)),
+                size - used,
                 name.as_ptr(),
                 &st,
                 next_off,
@@ -638,7 +635,7 @@ pub extern "C" fn junkfs_ll_readdir(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_releasedir(req: fuse::fuse_req_t, _ino: fuse::fuse_ino_t, fi: *mut fuse::fuse_file_info) {
     if fi.is_null() {
         unsafe { reply_err(req, EFAULT) };
@@ -650,7 +647,7 @@ pub extern "C" fn junkfs_ll_releasedir(req: fuse::fuse_req_t, _ino: fuse::fuse_i
     unsafe { reply_err(req, 0) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_fsync(
     req: fuse::fuse_req_t,
     ino: fuse::fuse_ino_t,
@@ -697,7 +694,7 @@ pub extern "C" fn junkfs_ll_fsync(
     unsafe { reply_err(req, 0) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_fsyncdir(
     req: fuse::fuse_req_t,
     ino: fuse::fuse_ino_t,
@@ -713,7 +710,7 @@ pub extern "C" fn junkfs_ll_fsyncdir(
     unsafe { reply_err(req, 0) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn junkfs_ll_create(
     req: fuse::fuse_req_t,
     parent: fuse::fuse_ino_t,
@@ -744,7 +741,7 @@ pub extern "C" fn junkfs_ll_create(
                 let fh = handle.lock().unwrap().fh;
                 unsafe {
                     (*fi).fh = fh;
-                    let mut e = inode_to_entry(&inode);
+                    let e = inode_to_entry(&inode);
                     fuse::fuse_reply_create(req, &e, fi);
                 }
             } else {

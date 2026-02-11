@@ -25,9 +25,17 @@ fn main() {
 
     let bindings = builder.generate().expect("bindgen failed");
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let bindings_path = out_path.join("bindings.rs");
     bindings
-        .write_to_file(out_path.join("bindings.rs"))
+        .write_to_file(&bindings_path)
         .expect("write bindings");
+
+    // rust 2024 requires unsafe extern blocks
+    let raw = std::fs::read_to_string(&bindings_path).expect("read bindings");
+    let patched = raw.replace("extern \"C\" {", "unsafe extern \"C\" {");
+    if raw != patched {
+        std::fs::write(&bindings_path, patched).expect("patch bindings");
+    }
 
     let mut cc_build = cc::Build::new();
     cc_build
