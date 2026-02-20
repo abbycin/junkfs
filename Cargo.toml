@@ -27,6 +27,6 @@ chrono = "0.4.38"
 junkfs-fuse = { path = "fuse" }
 libc = "0.2.155"
 log = "0.4.21"
-mace-kv = "0.0.26"
+mace-kv = "*"
 once_cell = "1.19.0"
 serde = { version = "1.0.202", features = ["derive"] }
