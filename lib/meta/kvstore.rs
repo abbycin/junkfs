@@ -19,12 +19,12 @@ impl MaceStore {
         let mut opt = Options::new(meta_path);
         opt.concurrent_write = 4;
         opt.wal_file_size = 32 << 20;
-        opt.max_log_size = 64 << 20;
         opt.gc_eager = true;
         opt.data_garbage_ratio = 10;
         opt.gc_timeout = 10000; // 10s
         opt.cache_capacity = 256 << 20;
-        opt.cache_count = 4096;
+        opt.lru_capacity = 256 << 20;
+        opt.pool_capacity = 256 << 30;
         opt.stat_mask_cache_count = 4096;
         opt.data_handle_cache_capacity = 64;
         opt.blob_handle_cache_capacity = 64;
