@@ -1,5 +1,5 @@
 use crate::cache::Flusher;
-use mace::{Bucket, Mace, OpCode, Options, TxnKV, TxnView};
+use mace::{Bucket, BucketOptions, Mace, OpCode, Options, TxnKV, TxnView};
 
 pub struct MaceStore {
     _db: Mace,
@@ -22,9 +22,7 @@ impl MaceStore {
         opt.gc_eager = true;
         opt.data_garbage_ratio = 10;
         opt.gc_timeout = 10000; // 10s
-        opt.cache_capacity = 256 << 20;
         opt.lru_capacity = 256 << 20;
-        opt.pool_capacity = 256 << 30;
         opt.stat_mask_cache_count = 4096;
         opt.data_handle_cache_capacity = 64;
         opt.blob_handle_cache_capacity = 64;
@@ -114,7 +112,15 @@ impl MaceStore {
         const META_BUCKET: &str = "junkfs_meta";
         match db.get_bucket(META_BUCKET) {
             Ok(b) => Ok(b),
-            Err(OpCode::NotFound) => db.new_bucket(META_BUCKET),
+            Err(OpCode::NotFound) => {
+                let opt = BucketOptions {
+                    cache_capacity: 256 << 20,
+                    pool_capacity: 512 << 20,
+                    checkpoint_size: 128 << 20,
+                    ..BucketOptions::default()
+                };
+                db.new_bucket(META_BUCKET, opt)
+            }
             Err(e) => Err(e),
         }
     }
