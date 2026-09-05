@@ -110,7 +110,7 @@ impl MaceStore {
 
     pub(crate) fn open_bucket(db: &Mace) -> Result<Bucket, OpCode> {
         const META_BUCKET: &str = "junkfs_meta";
-        match db.get_bucket(META_BUCKET) {
+        match db.open_bucket(META_BUCKET) {
             Ok(b) => Ok(b),
             Err(OpCode::NotFound) => {
                 let opt = BucketOptions {
