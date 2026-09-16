@@ -1,6 +1,3 @@
 /target
 .idea
 Cargo.lock
-*.md
-!README.md
-!docs/design.md
